@@ -75,23 +75,23 @@ warp_is_registered() {
 # IMPORTANT: this NEVER touches system-wide IPv6 (no sysctl disable_ipv6).
 # Disabling IPv6 at the OS level can drop your SSH session if the box's
 # management/console path relies on IPv6 in any way — we ran into exactly
-# that. Instead we pin the WireGuard tunnel endpoint to a literal Cloudflare
-# IPv4 address, which is enough to stop the tunnel from ever negotiating
-# over a broken IPv6 path, with zero risk to your existing connectivity.
-
-WARP_CANDIDATE_ENDPOINTS=(
-    "162.159.192.1:2408"
-    "162.159.193.10:2408"
-    "162.159.195.10:2408"
-    "162.159.192.20:2408"
-    "162.159.193.9:2408"
-)
+# that on this host.
+#
+# LESSON LEARNED THE HARD WAY (confirmed via `journalctl -u warp-svc`):
+# `warp-cli mode proxy` (the SOCKS5 listener on 10808 that this whole script
+# relies on) is HARD-CODED to only work with the MASQUE tunnel protocol.
+# Switching to WireGuard to pin a custom endpoint fails immediately with
+# error=InvalidKey("Proxy mode only supports MASQUE") — the daemon then
+# reports a misleading "Manual Disconnection". So there is no custom
+# endpoint / no WireGuard switch here. The only safe, working fix for a
+# host with broken IPv6 is: keep protocol=MASQUE, and route Cloudflare's
+# own IPv6 block to "unreachable" so MASQUE's happy-eyeballs logic fails
+# that path instantly instead of hanging on it.
 
 # Cloudflare's own IPv6 block. We do NOT touch system-wide IPv6 (that broke
 # your SSH session before). Instead we tell the kernel this one range is
 # "unreachable" so any attempt fails INSTANTLY instead of hanging/timing
-# out. This is what was stalling "happy eyeballs" at the Connecting stage
-# and starving the local SOCKS5 listener on port 10808.
+# out, letting MASQUE fall back to IPv4 immediately.
 warp_blackhole_cf_ipv6() {
     ip -6 route replace unreachable 2606:4700::/32 2>/dev/null
     ( crontab -l 2>/dev/null | grep -vF '2606:4700::/32' ; \
@@ -103,9 +103,8 @@ warp_unblackhole_cf_ipv6() {
     ( crontab -l 2>/dev/null | grep -vF '2606:4700::/32' ) | crontab -
 }
 
-# Poll warp-cli status instead of a blind sleep, since the WireGuard
-# handshake can take a variable amount of time (especially right after a
-# happy-eyeballs stall gets cleared).
+# Poll warp-cli status instead of a blind sleep, since the handshake can
+# take a variable amount of time.
 warp_wait_connected() {
     local timeout="${1:-15}"
     local i
@@ -116,112 +115,34 @@ warp_wait_connected() {
     return 1
 }
 
-# Pin a custom endpoint. Custom endpoints only apply to the WireGuard
-# protocol (MASQUE, the current default, ignores tunnel endpoint set), so we
-# switch protocol explicitly first. We also fall back to the legacy
-# set-custom-endpoint syntax for older warp-cli builds, and always print
-# whatever warp-cli actually said so failures are debuggable instead of silent.
-warp_set_endpoint() {
-    local endpoint="$1"
-    local out=""
-    out+="$(warp-cli tunnel protocol set WireGuard 2>&1)"$'\n'
-    out+="$(warp-cli tunnel endpoint set "$endpoint" 2>&1)"$'\n'
-    if echo "$out" | grep -qiE "error|fail|unrecognized|invalid|unknown"; then
-        out+="[fallback] $(warp-cli set-custom-endpoint "$endpoint" 2>&1)"$'\n'
-    fi
-    echo "$out"
-}
-
-# Quick health check: reconnect against a candidate endpoint, then fire a
-# handful of requests through the SOCKS5 proxy and see how many succeed and
-# how fast. Returns "successes:avg_ms" on stdout.
-warp_probe_endpoint() {
-    local endpoint="$1"
-    warp_disconnect >/dev/null 2>&1
-    LAST_ENDPOINT_LOG="$(warp_set_endpoint "$endpoint")"
-    warp_set_proxy_mode >/dev/null 2>&1
-    warp-cli connect >/dev/null 2>&1
-    warp_wait_connected 10 >/dev/null 2>&1
-
-    local ok=0
-    local total_ms=0
-    local i t0 t1 ms
-    for i in 1 2 3 4 5; do
-        t0=$(date +%s%N)
-        if curl -4 -s --max-time 3 --socks5-hostname 127.0.0.1:10808 \
-             https://www.cloudflare.com/cdn-cgi/trace &>/dev/null; then
-            t1=$(date +%s%N)
-            ms=$(( (t1 - t0) / 1000000 ))
-            total_ms=$((total_ms + ms))
-            ok=$((ok + 1))
-        fi
-    done
-
-    local avg=0
-    [[ $ok -gt 0 ]] && avg=$((total_ms / ok))
-    echo "${ok}:${avg}"
-}
-
 warp_fix_ipv6_issue() {
     if ! warp_is_installed; then
         echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
         return 1
     fi
 
-    echo -e "${CYAN}[*] Diagnosing tunnel endpoint (IPv4-only, no system network changes)...${NC}"
     ensure_warp_service
 
-    echo -e "${CYAN}[*] Blackholing Cloudflare's IPv6 range only (fixes happy-eyeballs stalls)...${NC}"
+    echo -e "${CYAN}[*] Blackholing Cloudflare's IPv6 range only (route-level, safe, persists on reboot)...${NC}"
     warp_blackhole_cf_ipv6
 
-    local best_endpoint=""
-    local best_ok=-1
-    local best_avg=999999
-    local endpoint result ok avg
-
-    for endpoint in "${WARP_CANDIDATE_ENDPOINTS[@]}"; do
-        echo -e "  Testing ${YELLOW}${endpoint}${NC} ..."
-        result=$(warp_probe_endpoint "$endpoint")
-        ok="${result%%:*}"
-        avg="${result##*:}"
-        echo -e "    -> ${ok}/5 succeeded, avg ${avg} ms"
-
-        if [[ "$ok" -gt "$best_ok" ]] || { [[ "$ok" -eq "$best_ok" ]] && [[ "$avg" -lt "$best_avg" ]]; }; then
-            best_ok=$ok
-            best_avg=$avg
-            best_endpoint=$endpoint
-        fi
-
-        # Perfect score with low latency -> good enough, stop scanning early
-        if [[ "$ok" -eq 5 ]] && [[ "$avg" -lt 200 ]]; then
-            break
-        fi
-    done
-
-    if [[ -z "$best_endpoint" || "$best_ok" -le 0 ]]; then
-        echo -e "${RED}[!] None of the candidate endpoints worked reliably.${NC}"
-        echo -e "${YELLOW}[>] Last warp-cli output for debugging:${NC}"
-        echo "$LAST_ENDPOINT_LOG"
-        echo -e "${YELLOW}[>] Your outbound network to Cloudflare may itself be filtered/unstable.${NC}"
-        return 1
-    fi
-
-    echo -e "${CYAN}[*] Locking tunnel to best endpoint: ${GREEN}${best_endpoint}${CYAN} (${best_ok}/5 ok, avg ${best_avg} ms)${NC}"
+    echo -e "${CYAN}[*] Clearing any custom endpoint (not supported in proxy mode) and forcing protocol=MASQUE...${NC}"
     warp_disconnect >/dev/null 2>&1
-    warp_set_endpoint "$best_endpoint" >/dev/null
+    warp-cli tunnel endpoint reset >/dev/null 2>&1
+    warp-cli tunnel protocol set MASQUE
+
     warp_set_proxy_mode
     warp-cli connect
-    if ! warp_wait_connected 15; then
-        echo -e "${YELLOW}[!] Still stuck in 'Connecting' after 15s — run 'warp-cli status' to see the reason.${NC}"
-    fi
 
-    if warp_is_connected; then
+    if warp_wait_connected 15; then
         local ip
         ip=$(curl -4 -s --max-time 5 --socks5-hostname 127.0.0.1:10808 https://ifconfig.me 2>/dev/null)
-        echo -e "${GREEN}[✓] Connected. Exit IP is now (should be IPv4): ${ip:-N/A}${NC}"
-        echo -e "${GREEN}[✓] This endpoint is now pinned so future reconnects stay IPv4.${NC}"
+        echo -e "${GREEN}[✓] Connected. Exit IP: ${ip:-N/A}${NC}"
+        echo -e "${GREEN}[✓] Cloudflare's IPv6 route is now blackholed, so future reconnects won't stall on it.${NC}"
     else
-        echo -e "${RED}[!] Connected flag not set — check 'warp-cli status' manually.${NC}"
+        echo -e "${RED}[!] Still not connected after 15s.${NC}"
+        echo -e "${YELLOW}[>] Run: journalctl -u warp-svc --no-pager -n 40   and check the last ERROR line.${NC}"
+        return 1
     fi
 }
 
@@ -230,9 +151,10 @@ warp_reset_endpoint() {
         echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
         return 1
     fi
-    echo -e "${YELLOW}[*] Resetting tunnel endpoint to Cloudflare's default...${NC}"
+    echo -e "${YELLOW}[*] Resetting to Cloudflare's defaults (protocol=MASQUE, no custom endpoint, IPv6 route restored)...${NC}"
     warp_disconnect >/dev/null 2>&1
-    warp-cli tunnel endpoint reset
+    warp-cli tunnel endpoint reset >/dev/null 2>&1
+    warp-cli tunnel protocol set MASQUE
     warp_unblackhole_cf_ipv6
     warp_set_proxy_mode
     warp-cli connect
@@ -258,11 +180,11 @@ get_warp_ip() {
     local proxy_port="10808"
     local ip=""
 
-    ip=$(curl -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" \
+    ip=$(curl -4 -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" \
         https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}')
 
     if [[ -z "$ip" ]]; then
-        ip=$(curl -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" https://ifconfig.me 2>/dev/null)
+        ip=$(curl -4 -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" https://ifconfig.me 2>/dev/null)
     fi
 
     echo "$ip"
@@ -561,7 +483,7 @@ draw_menu() {
     echo "  7) Change IP (New Identity / New Registration)"
     echo "  8) Remove Cloudflare WARP"
     echo "  9) Fix MTU (1350) + persist on reboot"
-    echo " 10) Fix broken-IPv6 issue (pin tunnel to best IPv4 endpoint)"
+    echo " 10) Fix broken-IPv6 issue (blackhole Cloudflare IPv6, keep MASQUE)"
     echo " 11) Reset tunnel endpoint to Cloudflare default"
     echo "  0) Exit"
     echo "=================================================================="
