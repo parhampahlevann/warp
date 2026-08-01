@@ -71,6 +71,122 @@ warp_is_registered() {
     warp-cli registration show 2>/dev/null | grep -qiE "account|device"
 }
 
+# ===================== IPv6-broken-network fix ==============================
+# IMPORTANT: this NEVER touches system-wide IPv6 (no sysctl disable_ipv6).
+# Disabling IPv6 at the OS level can drop your SSH session if the box's
+# management/console path relies on IPv6 in any way — we ran into exactly
+# that. Instead we pin the WireGuard tunnel endpoint to a literal Cloudflare
+# IPv4 address, which is enough to stop the tunnel from ever negotiating
+# over a broken IPv6 path, with zero risk to your existing connectivity.
+
+WARP_CANDIDATE_ENDPOINTS=(
+    "162.159.192.1:2408"
+    "162.159.193.10:2408"
+    "162.159.195.10:2408"
+    "162.159.192.20:2408"
+    "162.159.193.9:2408"
+)
+
+# Quick health check: reconnect against a candidate endpoint, then fire a
+# handful of requests through the SOCKS5 proxy and see how many succeed and
+# how fast. Returns "successes:avg_ms" on stdout.
+warp_probe_endpoint() {
+    local endpoint="$1"
+    warp_disconnect >/dev/null 2>&1
+    warp-cli tunnel endpoint set "$endpoint" >/dev/null 2>&1
+    warp_set_proxy_mode >/dev/null 2>&1
+    warp-cli connect >/dev/null 2>&1
+    sleep 3
+
+    local ok=0
+    local total_ms=0
+    local i t0 t1 ms
+    for i in 1 2 3 4 5; do
+        t0=$(date +%s%N)
+        if curl -4 -s --max-time 3 --socks5-hostname 127.0.0.1:10808 \
+             https://www.cloudflare.com/cdn-cgi/trace &>/dev/null; then
+            t1=$(date +%s%N)
+            ms=$(( (t1 - t0) / 1000000 ))
+            total_ms=$((total_ms + ms))
+            ok=$((ok + 1))
+        fi
+    done
+
+    local avg=0
+    [[ $ok -gt 0 ]] && avg=$((total_ms / ok))
+    echo "${ok}:${avg}"
+}
+
+warp_fix_ipv6_issue() {
+    if ! warp_is_installed; then
+        echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}[*] Diagnosing tunnel endpoint (IPv4-only, no system network changes)...${NC}"
+    ensure_warp_service
+
+    local best_endpoint=""
+    local best_ok=-1
+    local best_avg=999999
+    local endpoint result ok avg
+
+    for endpoint in "${WARP_CANDIDATE_ENDPOINTS[@]}"; do
+        echo -e "  Testing ${YELLOW}${endpoint}${NC} ..."
+        result=$(warp_probe_endpoint "$endpoint")
+        ok="${result%%:*}"
+        avg="${result##*:}"
+        echo -e "    -> ${ok}/5 succeeded, avg ${avg} ms"
+
+        if [[ "$ok" -gt "$best_ok" ]] || { [[ "$ok" -eq "$best_ok" ]] && [[ "$avg" -lt "$best_avg" ]]; }; then
+            best_ok=$ok
+            best_avg=$avg
+            best_endpoint=$endpoint
+        fi
+
+        # Perfect score with low latency -> good enough, stop scanning early
+        if [[ "$ok" -eq 5 ]] && [[ "$avg" -lt 200 ]]; then
+            break
+        fi
+    done
+
+    if [[ -z "$best_endpoint" || "$best_ok" -le 0 ]]; then
+        echo -e "${RED}[!] None of the candidate endpoints worked reliably.${NC}"
+        echo -e "${YELLOW}[>] Your outbound network to Cloudflare may itself be filtered/unstable.${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}[*] Locking tunnel to best endpoint: ${GREEN}${best_endpoint}${CYAN} (${best_ok}/5 ok, avg ${best_avg} ms)${NC}"
+    warp_disconnect >/dev/null 2>&1
+    warp-cli tunnel endpoint set "$best_endpoint"
+    warp_set_proxy_mode
+    warp-cli connect
+    sleep 3
+
+    if warp_is_connected; then
+        local ip
+        ip=$(curl -4 -s --max-time 5 --socks5-hostname 127.0.0.1:10808 https://ifconfig.me 2>/dev/null)
+        echo -e "${GREEN}[✓] Connected. Exit IP is now (should be IPv4): ${ip:-N/A}${NC}"
+        echo -e "${GREEN}[✓] This endpoint is now pinned so future reconnects stay IPv4.${NC}"
+    else
+        echo -e "${RED}[!] Connected flag not set — check 'warp-cli status' manually.${NC}"
+    fi
+}
+
+warp_reset_endpoint() {
+    if ! warp_is_installed; then
+        echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
+        return 1
+    fi
+    echo -e "${YELLOW}[*] Resetting tunnel endpoint to Cloudflare's default...${NC}"
+    warp_disconnect >/dev/null 2>&1
+    warp-cli tunnel endpoint reset
+    warp_set_proxy_mode
+    warp-cli connect
+    sleep 3
+    warp_status
+}
+
 # ===================== Service Helpers ======================================
 
 ensure_warp_service() {
@@ -173,7 +289,13 @@ warp_install() {
     echo -e "${GREEN}[✓] Cloudflare WARP installed successfully.${NC}"
 
     warp_fix_mtu
+
+    echo -e "${CYAN}[*] Verifying tunnel connectivity (auto-selects an IPv4 endpoint if needed)...${NC}"
     warp_connect
+    if ! warp_is_connected; then
+        echo -e "${YELLOW}[!] Default connect failed or unstable, retrying with IPv4 pinning...${NC}"
+        warp_fix_ipv6_issue
+    fi
 }
 
 warp_connect() {
@@ -386,9 +508,11 @@ draw_menu() {
     echo "  7) Change IP (New Identity / New Registration)"
     echo "  8) Remove Cloudflare WARP"
     echo "  9) Fix MTU (1350) + persist on reboot"
+    echo " 10) Fix broken-IPv6 issue (pin tunnel to best IPv4 endpoint)"
+    echo " 11) Reset tunnel endpoint to Cloudflare default"
     echo "  0) Exit"
     echo "=================================================================="
-    echo -ne "${YELLOW}Select an option [0-9]: ${NC}"
+    echo -ne "${YELLOW}Select an option [0-11]: ${NC}"
 }
 
 main_menu() {
@@ -406,12 +530,14 @@ main_menu() {
             7) warp_change_ip_new_identity ;;
             8) warp_remove ;;
             9) warp_fix_mtu ;;
+            10) warp_fix_ipv6_issue ;;
+            11) warp_reset_endpoint ;;
             0)
                 echo -e "${GREEN}Goodbye!${NC}"
                 exit 0
                 ;;
             *)
-                echo -e "${RED}[!] Invalid option. Please choose 0-9.${NC}"
+                echo -e "${RED}[!] Invalid option. Please choose 0-11.${NC}"
                 ;;
         esac
 
