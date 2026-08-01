@@ -180,11 +180,17 @@ get_warp_ip() {
     local proxy_port="10808"
     local ip=""
 
-    ip=$(curl -4 -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" \
-        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}')
+    # IMPORTANT: with --socks5-hostname, DNS resolution happens INSIDE
+    # warp-svc, not in curl — so curl's -4 flag has no effect on which
+    # family warp-svc picks for a dual-stack hostname. We sidestep this
+    # entirely by querying hostnames that are guaranteed to have ONLY an
+    # A record (no AAAA at all), so there is no IPv6 option to pick.
+    ip=$(curl -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" \
+        https://api4.ipify.org 2>/dev/null)
 
     if [[ -z "$ip" ]]; then
-        ip=$(curl -4 -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" https://ifconfig.me 2>/dev/null)
+        ip=$(curl -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" \
+            https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]')
     fi
 
     echo "$ip"
