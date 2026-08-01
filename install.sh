@@ -87,16 +87,61 @@ WARP_CANDIDATE_ENDPOINTS=(
     "162.159.193.9:2408"
 )
 
+# Cloudflare's own IPv6 block. We do NOT touch system-wide IPv6 (that broke
+# your SSH session before). Instead we tell the kernel this one range is
+# "unreachable" so any attempt fails INSTANTLY instead of hanging/timing
+# out. This is what was stalling "happy eyeballs" at the Connecting stage
+# and starving the local SOCKS5 listener on port 10808.
+warp_blackhole_cf_ipv6() {
+    ip -6 route replace unreachable 2606:4700::/32 2>/dev/null
+    ( crontab -l 2>/dev/null | grep -vF '2606:4700::/32' ; \
+      echo '@reboot ip -6 route replace unreachable 2606:4700::/32 2>/dev/null' ) | crontab -
+}
+
+warp_unblackhole_cf_ipv6() {
+    ip -6 route del unreachable 2606:4700::/32 2>/dev/null
+    ( crontab -l 2>/dev/null | grep -vF '2606:4700::/32' ) | crontab -
+}
+
+# Poll warp-cli status instead of a blind sleep, since the WireGuard
+# handshake can take a variable amount of time (especially right after a
+# happy-eyeballs stall gets cleared).
+warp_wait_connected() {
+    local timeout="${1:-15}"
+    local i
+    for ((i = 0; i < timeout; i++)); do
+        warp_is_connected && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Pin a custom endpoint. Custom endpoints only apply to the WireGuard
+# protocol (MASQUE, the current default, ignores tunnel endpoint set), so we
+# switch protocol explicitly first. We also fall back to the legacy
+# set-custom-endpoint syntax for older warp-cli builds, and always print
+# whatever warp-cli actually said so failures are debuggable instead of silent.
+warp_set_endpoint() {
+    local endpoint="$1"
+    local out=""
+    out+="$(warp-cli tunnel protocol set WireGuard 2>&1)"$'\n'
+    out+="$(warp-cli tunnel endpoint set "$endpoint" 2>&1)"$'\n'
+    if echo "$out" | grep -qiE "error|fail|unrecognized|invalid|unknown"; then
+        out+="[fallback] $(warp-cli set-custom-endpoint "$endpoint" 2>&1)"$'\n'
+    fi
+    echo "$out"
+}
+
 # Quick health check: reconnect against a candidate endpoint, then fire a
 # handful of requests through the SOCKS5 proxy and see how many succeed and
 # how fast. Returns "successes:avg_ms" on stdout.
 warp_probe_endpoint() {
     local endpoint="$1"
     warp_disconnect >/dev/null 2>&1
-    warp-cli tunnel endpoint set "$endpoint" >/dev/null 2>&1
+    LAST_ENDPOINT_LOG="$(warp_set_endpoint "$endpoint")"
     warp_set_proxy_mode >/dev/null 2>&1
     warp-cli connect >/dev/null 2>&1
-    sleep 3
+    warp_wait_connected 10 >/dev/null 2>&1
 
     local ok=0
     local total_ms=0
@@ -126,6 +171,9 @@ warp_fix_ipv6_issue() {
     echo -e "${CYAN}[*] Diagnosing tunnel endpoint (IPv4-only, no system network changes)...${NC}"
     ensure_warp_service
 
+    echo -e "${CYAN}[*] Blackholing Cloudflare's IPv6 range only (fixes happy-eyeballs stalls)...${NC}"
+    warp_blackhole_cf_ipv6
+
     local best_endpoint=""
     local best_ok=-1
     local best_avg=999999
@@ -152,16 +200,20 @@ warp_fix_ipv6_issue() {
 
     if [[ -z "$best_endpoint" || "$best_ok" -le 0 ]]; then
         echo -e "${RED}[!] None of the candidate endpoints worked reliably.${NC}"
+        echo -e "${YELLOW}[>] Last warp-cli output for debugging:${NC}"
+        echo "$LAST_ENDPOINT_LOG"
         echo -e "${YELLOW}[>] Your outbound network to Cloudflare may itself be filtered/unstable.${NC}"
         return 1
     fi
 
     echo -e "${CYAN}[*] Locking tunnel to best endpoint: ${GREEN}${best_endpoint}${CYAN} (${best_ok}/5 ok, avg ${best_avg} ms)${NC}"
     warp_disconnect >/dev/null 2>&1
-    warp-cli tunnel endpoint set "$best_endpoint"
+    warp_set_endpoint "$best_endpoint" >/dev/null
     warp_set_proxy_mode
     warp-cli connect
-    sleep 3
+    if ! warp_wait_connected 15; then
+        echo -e "${YELLOW}[!] Still stuck in 'Connecting' after 15s — run 'warp-cli status' to see the reason.${NC}"
+    fi
 
     if warp_is_connected; then
         local ip
@@ -181,9 +233,10 @@ warp_reset_endpoint() {
     echo -e "${YELLOW}[*] Resetting tunnel endpoint to Cloudflare's default...${NC}"
     warp_disconnect >/dev/null 2>&1
     warp-cli tunnel endpoint reset
+    warp_unblackhole_cf_ipv6
     warp_set_proxy_mode
     warp-cli connect
-    sleep 3
+    warp_wait_connected 15 >/dev/null 2>&1
     warp_status
 }
 
