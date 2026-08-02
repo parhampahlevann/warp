@@ -1,23 +1,47 @@
 #!/bin/bash
 
 ###############################################################################
-# Cloudflare WARP Proxy Manager  (fixed)
-# - Uses warp-cli in proxy mode (SOCKS5 127.0.0.1:10808)
-# - Installs Cloudflare WARP (cloudflare-warp) on Debian/Ubuntu systems
-# - Provides menu to:
-#     * Install / Reinstall WARP
-#     * Connect / Disconnect
-#     * Show Status
-#     * Test Proxy
-#     * Change IP (Quick reconnect)
-#     * Change IP (New identity / new registration)
-#     * Fix MTU (persist via cron @reboot)
-#     * Remove WARP
+# WARP -> Xray (x-ui) WireGuard Outbound Setup
+#
+# Why this exists / history:
+#   The original approach used Cloudflare's official warp-cli client in
+#   "proxy mode" (SOCKS5 on 127.0.0.1:10808) as an outbound for x-ui.
+#   On this host that approach hit a hard wall: warp-cli's proxy mode is
+#   locked to the MASQUE (QUIC/UDP-443) transport, and QUIC traffic from
+#   this network was being actively shaped/dropped a few seconds into every
+#   session (confirmed via journalctl: ~20-30% one-way packet loss on the
+#   client->edge leg only, despite perfect ICMP ping — a classic sign of
+#   protocol-specific traffic shaping, not a real network problem).
+#
+#   WireGuard (a different protocol/signature) is NOT usable through
+#   warp-cli's proxy mode at all (error: "Proxy mode only supports MASQUE").
+#
+#   The fix: skip warp-cli/warp-svc entirely. Use `wgcf` (unofficial,
+#   well-established CLI) to register a free WARP account and obtain raw
+#   WireGuard credentials, then add Xray-core's OWN native "wireguard"
+#   outbound (no SOCKS5 layer, no warp-svc daemon at all) directly in
+#   x-ui's Xray Configuration. This is the standard, well-supported pattern
+#   used by most x-ui/3x-ui WARP integrations.
+#
+# What this script does:
+#   1) Installs wgcf (auto-detects latest release + your CPU arch)
+#   2) Registers a free WARP account (wgcf register)
+#   3) Generates a WireGuard profile (wgcf generate)
+#   4) Prints a ready-to-paste Xray "wireguard" outbound JSON block
+#   5) (Optional) Does a real, temporary wg-quick test to confirm the
+#      credentials actually work end-to-end BEFORE you paste anything into
+#      the panel — so you're not debugging blind inside x-ui's textbox.
+#
+# What this script deliberately does NOT do:
+#   - It does not touch x-ui's config/database directly. x-ui (classic
+#     vaxilu fork) stores the Xray config as a JSON blob inside its own
+#     sqlite DB via the web UI ("Panel Settings" -> "Xray Configuration"),
+#     and there is no stable, version-safe way to patch that from a shell
+#     script without risking corruption. You paste the generated JSON
+#     yourself, which is safer and lets you see exactly what changed.
 ###############################################################################
 
 set -uo pipefail
-
-# ===================== Colors & Version ======================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -25,430 +49,256 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
-VERSION="3.2"
+VERSION="1.0"
+
+WORKDIR="/root/warp-wireguard"
+WGCF_BIN="${WORKDIR}/wgcf"
+WGCF_ACCOUNT="${WORKDIR}/wgcf-account.toml"
+WGCF_PROFILE="${WORKDIR}/wgcf-profile.conf"
+
+# Cloudflare's well-known WARP peer public key (constant across accounts).
+CF_PEER_PUBKEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+CF_ENDPOINT="engage.cloudflareclient.com:2408"
 
 # ===================== Root Check ===========================================
 
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}[ERROR] This script must be run as root.${NC}"
-    echo -e "${YELLOW}Usage: sudo warp-menu${NC}"
+    echo -e "${YELLOW}Usage: sudo bash warp-xray-setup.sh${NC}"
     exit 1
 fi
 
-# ===================== Basic Checks =========================================
+mkdir -p "$WORKDIR"
+cd "$WORKDIR" || exit 1
 
-warp_is_installed() {
-    command -v warp-cli &>/dev/null
-}
+# ===================== Helpers ==============================================
 
-warp_is_connected() {
-    warp-cli status 2>/dev/null | grep -iq "Connected"
-}
-
-# Detect whether this warp-cli build uses the old ("set-mode") or new
-# ("mode") sub-command syntax, so we don't silently fail on either version.
-warp_cli_syntax() {
-    if warp-cli --help 2>/dev/null | grep -qE '^\s*mode\b'; then
-        echo "new"
-    else
-        echo "old"
-    fi
-}
-
-warp_set_proxy_mode() {
-    local syntax
-    syntax=$(warp_cli_syntax)
-    if [[ "$syntax" == "new" ]]; then
-        warp-cli mode proxy
-        warp-cli proxy port 10808
-    else
-        warp-cli set-mode proxy
-        warp-cli set-proxy-port 10808
-    fi
-}
-
-warp_is_registered() {
-    warp-cli registration show 2>/dev/null | grep -qiE "account|device"
-}
-
-# ===================== IPv6-broken-network fix ==============================
-# IMPORTANT: this NEVER touches system-wide IPv6 (no sysctl disable_ipv6).
-# Disabling IPv6 at the OS level can drop your SSH session if the box's
-# management/console path relies on IPv6 in any way — we ran into exactly
-# that on this host.
-#
-# LESSON LEARNED THE HARD WAY (confirmed via `journalctl -u warp-svc`):
-# `warp-cli mode proxy` (the SOCKS5 listener on 10808 that this whole script
-# relies on) is HARD-CODED to only work with the MASQUE tunnel protocol.
-# Switching to WireGuard to pin a custom endpoint fails immediately with
-# error=InvalidKey("Proxy mode only supports MASQUE") — the daemon then
-# reports a misleading "Manual Disconnection". So there is no custom
-# endpoint / no WireGuard switch here. The only safe, working fix for a
-# host with broken IPv6 is: keep protocol=MASQUE, and route Cloudflare's
-# own IPv6 block to "unreachable" so MASQUE's happy-eyeballs logic fails
-# that path instantly instead of hanging on it.
-
-# Cloudflare's own IPv6 block. We do NOT touch system-wide IPv6 (that broke
-# your SSH session before). Instead we tell the kernel this one range is
-# "unreachable" so any attempt fails INSTANTLY instead of hanging/timing
-# out, letting MASQUE fall back to IPv4 immediately.
-warp_blackhole_cf_ipv6() {
-    ip -6 route replace unreachable 2606:4700::/32 2>/dev/null
-    ( crontab -l 2>/dev/null | grep -vF '2606:4700::/32' ; \
-      echo '@reboot ip -6 route replace unreachable 2606:4700::/32 2>/dev/null' ) | crontab -
-}
-
-warp_unblackhole_cf_ipv6() {
-    ip -6 route del unreachable 2606:4700::/32 2>/dev/null
-    ( crontab -l 2>/dev/null | grep -vF '2606:4700::/32' ) | crontab -
-}
-
-# Poll warp-cli status instead of a blind sleep, since the handshake can
-# take a variable amount of time.
-warp_wait_connected() {
-    local timeout="${1:-15}"
-    local i
-    for ((i = 0; i < timeout; i++)); do
-        warp_is_connected && return 0
-        sleep 1
-    done
-    return 1
-}
-
-warp_fix_ipv6_issue() {
-    if ! warp_is_installed; then
-        echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
-        return 1
-    fi
-
-    ensure_warp_service
-
-    echo -e "${CYAN}[*] Blackholing Cloudflare's IPv6 range only (route-level, safe, persists on reboot)...${NC}"
-    warp_blackhole_cf_ipv6
-
-    echo -e "${CYAN}[*] Clearing any custom endpoint (not supported in proxy mode) and forcing protocol=MASQUE...${NC}"
-    warp_disconnect >/dev/null 2>&1
-    warp-cli tunnel endpoint reset >/dev/null 2>&1
-    warp-cli tunnel protocol set MASQUE
-
-    warp_set_proxy_mode
-    warp-cli connect
-
-    if warp_wait_connected 15; then
-        local ip
-        ip=$(curl -4 -s --max-time 5 --socks5-hostname 127.0.0.1:10808 https://ifconfig.me 2>/dev/null)
-        echo -e "${GREEN}[✓] Connected. Exit IP: ${ip:-N/A}${NC}"
-        echo -e "${GREEN}[✓] Cloudflare's IPv6 route is now blackholed, so future reconnects won't stall on it.${NC}"
-    else
-        echo -e "${RED}[!] Still not connected after 15s.${NC}"
-        echo -e "${YELLOW}[>] Run: journalctl -u warp-svc --no-pager -n 40   and check the last ERROR line.${NC}"
-        return 1
-    fi
-}
-
-warp_reset_endpoint() {
-    if ! warp_is_installed; then
-        echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
-        return 1
-    fi
-    echo -e "${YELLOW}[*] Resetting to Cloudflare's defaults (protocol=MASQUE, no custom endpoint, IPv6 route restored)...${NC}"
-    warp_disconnect >/dev/null 2>&1
-    warp-cli tunnel endpoint reset >/dev/null 2>&1
-    warp-cli tunnel protocol set MASQUE
-    warp_unblackhole_cf_ipv6
-    warp_set_proxy_mode
-    warp-cli connect
-    warp_wait_connected 15 >/dev/null 2>&1
-    warp_status
-}
-
-# ===================== Service Helpers ======================================
-
-ensure_warp_service() {
-    if command -v systemctl &>/dev/null; then
-        systemctl enable --now warp-svc 2>/dev/null || systemctl restart warp-svc 2>/dev/null
-    elif command -v service &>/dev/null; then
-        service warp-svc start 2>/dev/null || service warp-svc restart 2>/dev/null
-    fi
-    sleep 1
-}
-
-# ===================== IP / Proxy Helper ====================================
-
-get_warp_ip() {
-    local proxy_ip="127.0.0.1"
-    local proxy_port="10808"
-    local ip=""
-
-    # IMPORTANT: with --socks5-hostname, DNS resolution happens INSIDE
-    # warp-svc, not in curl — so curl's -4 flag has no effect on which
-    # family warp-svc picks for a dual-stack hostname. We sidestep this
-    # entirely by querying hostnames that are guaranteed to have ONLY an
-    # A record (no AAAA at all), so there is no IPv6 option to pick.
-    ip=$(curl -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" \
-        https://api4.ipify.org 2>/dev/null)
-
-    if [[ -z "$ip" ]]; then
-        ip=$(curl -s --max-time 5 --socks5-hostname "${proxy_ip}:${proxy_port}" \
-            https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]')
-    fi
-
-    echo "$ip"
-}
-
-# ===================== MTU Fix ==============================================
-
-warp_fix_mtu() {
-    echo -e "${CYAN}[*] Setting MTU 1350 on all non-loopback interfaces...${NC}"
-    local iface
-    for iface in $(ls /sys/class/net | grep -v '^lo$'); do
-        ip link set dev "$iface" mtu 1350 2>/dev/null \
-            && echo -e "  ${GREEN}✓${NC} $iface -> mtu 1350" \
-            || echo -e "  ${YELLOW}![skip]${NC} $iface"
-    done
-
-    # Persist across reboot via cron, without duplicating the entry
-    local cron_line='@reboot for iface in $(ls /sys/class/net | grep -v "^lo$"); do ip link set dev "$iface" mtu 1350; done'
-    ( crontab -l 2>/dev/null | grep -vF 'mtu 1350' ; echo "$cron_line" ) | crontab -
-    echo -e "${GREEN}[✓] MTU fix applied and persisted via @reboot cron job.${NC}"
-}
-
-# ===================== Core Actions =========================================
-
-warp_install() {
-    if warp_is_installed; then
-        echo -e "${GREEN}[INFO] Cloudflare WARP is already installed.${NC}"
-        read -rp "Do you want to reinstall it? [y/N]: " confirm
-        [[ ! "$confirm" =~ ^[Yy]$ ]] && return
-    fi
-
-    echo -e "${CYAN}[+] Installing Cloudflare WARP (warp-cli)...${NC}"
-
-    # Install prerequisites FIRST so lsb_release actually exists before we call it
-    if ! apt-get update; then
-        echo -e "${RED}[ERROR] apt-get update failed. Check your network/apt sources.${NC}"
-        return 1
-    fi
-    if ! apt-get install -y curl gpg lsb-release apt-transport-https ca-certificates; then
-        echo -e "${RED}[ERROR] Failed to install prerequisites.${NC}"
-        return 1
-    fi
-
-    # Determine distribution codename, whitelist-style (safer than blacklisting)
-    local codename
-    codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
-    case "$codename" in
-        focal|jammy)
-            : # natively supported by Cloudflare's repo, keep as-is
-            ;;
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l) echo "armv7" ;;
+        armv6l) echo "armv6" ;;
+        i386|i686) echo "386" ;;
         *)
-            echo -e "${YELLOW}[INFO] '$codename' has no official Cloudflare repo yet; falling back to 'jammy' packages.${NC}"
-            codename="jammy"
+            echo -e "${RED}[ERROR] Unsupported CPU architecture: $(uname -m)${NC}" >&2
+            echo ""
             ;;
     esac
-
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
-        gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    if [[ ! -s /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg ]]; then
-        echo -e "${RED}[ERROR] Failed to fetch/import Cloudflare GPG key.${NC}"
-        return 1
-    fi
-
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" \
-        > /etc/apt/sources.list.d/cloudflare-client.list
-
-    if ! apt-get update; then
-        echo -e "${RED}[ERROR] apt-get update failed after adding Cloudflare repo.${NC}"
-        return 1
-    fi
-    if ! apt-get install -y cloudflare-warp; then
-        echo -e "${RED}[ERROR] Failed to install cloudflare-warp package.${NC}"
-        return 1
-    fi
-
-    ensure_warp_service
-    echo -e "${GREEN}[✓] Cloudflare WARP installed successfully.${NC}"
-
-    warp_fix_mtu
-
-    echo -e "${CYAN}[*] Verifying tunnel connectivity (auto-selects an IPv4 endpoint if needed)...${NC}"
-    warp_connect
-    if ! warp_is_connected; then
-        echo -e "${YELLOW}[!] Default connect failed or unstable, retrying with IPv4 pinning...${NC}"
-        warp_fix_ipv6_issue
-    fi
 }
 
-warp_connect() {
-    if ! warp_is_installed; then
-        echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
+# Fallback version used only if the GitHub API call fails/rate-limits.
+WGCF_FALLBACK_VERSION="2.2.32"
+
+wgcf_is_installed() {
+    [[ -x "$WGCF_BIN" ]]
+}
+
+# ===================== Install wgcf =========================================
+
+install_wgcf() {
+    local arch
+    arch=$(detect_arch)
+    if [[ -z "$arch" ]]; then
         return 1
     fi
 
-    ensure_warp_service
-    echo -e "${BLUE}[*] Connecting to Cloudflare WARP...${NC}"
+    echo -e "${CYAN}[*] Detecting latest wgcf release...${NC}"
+    local tag=""
+    tag=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":\s*"v?([^"]+)".*/\1/')
 
-    if ! warp_is_registered; then
-        echo -e "${YELLOW}[INFO] Creating new WARP account registration...${NC}"
-        warp-cli registration new
-        sleep 1
-    fi
-
-    warp_set_proxy_mode
-    warp-cli connect
-    sleep 3
-
-    if warp_is_connected; then
-        echo -e "${GREEN}[✓] Connected to WARP successfully.${NC}"
+    if [[ -z "$tag" ]]; then
+        echo -e "${YELLOW}[!] Could not reach GitHub API (rate limit or network). Falling back to v${WGCF_FALLBACK_VERSION}.${NC}"
+        tag="$WGCF_FALLBACK_VERSION"
     else
-        echo -e "${RED}[!] Failed to connect to WARP. Run option 4 for details.${NC}"
+        echo -e "${GREEN}[✓] Latest wgcf version: v${tag}${NC}"
     fi
+
+    local asset="wgcf_${tag}_linux_${arch}"
+    local url="https://github.com/ViRb3/wgcf/releases/download/v${tag}/${asset}"
+
+    echo -e "${CYAN}[*] Downloading ${asset}...${NC}"
+    if ! curl -fsSL "$url" -o "$WGCF_BIN"; then
+        echo -e "${RED}[ERROR] Download failed from: ${url}${NC}"
+        echo -e "${YELLOW}[>] Check available assets manually: https://github.com/ViRb3/wgcf/releases${NC}"
+        return 1
+    fi
+
+    chmod +x "$WGCF_BIN"
+    echo -e "${GREEN}[✓] wgcf installed at ${WGCF_BIN}${NC}"
+    "$WGCF_BIN" --version 2>/dev/null || true
 }
 
-warp_disconnect() {
-    if ! warp_is_installed; then
-        echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
+# ===================== Register + Generate ===================================
+
+wgcf_do_register() {
+    if ! wgcf_is_installed; then
+        echo -e "${RED}[ERROR] wgcf is not installed yet. Run option 1 first.${NC}"
         return 1
     fi
-    echo -e "${YELLOW}[*] Disconnecting WARP...${NC}"
-    warp-cli disconnect 2>/dev/null || true
-    sleep 1
+    if [[ -f "$WGCF_ACCOUNT" ]]; then
+        echo -e "${YELLOW}[INFO] An account already exists at ${WGCF_ACCOUNT}.${NC}"
+        read -rp "Register a brand new account instead? [y/N]: " confirm
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && return 0
+        rm -f "$WGCF_ACCOUNT"
+    fi
+    echo -e "${CYAN}[*] Registering a new free WARP account...${NC}"
+    (cd "$WORKDIR" && "$WGCF_BIN" register --accept-tos)
 }
 
-warp_status() {
-    if ! warp_is_installed; then
-        echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
+wgcf_do_generate() {
+    if ! wgcf_is_installed; then
+        echo -e "${RED}[ERROR] wgcf is not installed yet. Run option 1 first.${NC}"
         return 1
     fi
-
-    ensure_warp_service
-
-    echo -e "${CYAN}===== WARP Status =====${NC}"
-    warp-cli status
-
-    if warp_is_connected; then
-        local ip
-        ip=$(get_warp_ip)
-        [[ -n "$ip" ]] && echo -e "${GREEN}Proxy IP (via WARP): $ip${NC}"
-    fi
-}
-
-warp_test_proxy() {
-    if ! warp_is_installed; then
-        echo -e "${RED}[ERROR] warp-cli is not installed.${NC}"
+    if [[ ! -f "$WGCF_ACCOUNT" ]]; then
+        echo -e "${RED}[ERROR] No account found. Run option 2 (register) first.${NC}"
         return 1
     fi
-
-    echo -e "${CYAN}[*] Testing SOCKS5 proxy 127.0.0.1:10808 ...${NC}"
-
-    if ! warp_is_connected; then
-        echo -e "${RED}[ERROR] WARP is not connected. Please connect first.${NC}"
-        return 1
-    fi
-
-    local ip
-    ip=$(get_warp_ip)
-    if [[ -n "$ip" ]]; then
-        echo -e "${GREEN}[✓] Proxy is working. Outgoing IP: $ip${NC}"
-        if curl -s --max-time 5 --socks5-hostname 127.0.0.1:10808 https://www.cloudflare.com &>/dev/null; then
-            echo -e "${GREEN}[✓] Internet connectivity via WARP is OK.${NC}"
-        else
-            echo -e "${YELLOW}[!] Connectivity test failed (Cloudflare site not reachable).${NC}"
-        fi
+    echo -e "${CYAN}[*] Generating WireGuard profile...${NC}"
+    (cd "$WORKDIR" && "$WGCF_BIN" generate)
+    if [[ -f "$WGCF_PROFILE" ]]; then
+        echo -e "${GREEN}[✓] Profile written to ${WGCF_PROFILE}${NC}"
     else
-        echo -e "${RED}[!] Failed to detect outgoing IP. Proxy test failed.${NC}"
+        echo -e "${RED}[ERROR] Profile generation failed.${NC}"
+        return 1
     fi
 }
 
-warp_remove() {
-    echo -e "${RED}[WARNING] This will remove Cloudflare WARP from your system.${NC}"
-    read -rp "Are you sure you want to continue? [y/N]: " confirm
-    [[ ! "$confirm" =~ ^[Yy]$ ]] && return
+# ===================== Parse profile & emit Xray JSON ========================
 
-    if warp_is_installed; then
-        warp_disconnect
-    fi
-
-    apt-get remove --purge -y cloudflare-warp || true
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list
-    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    apt-get autoremove -y
-
-    echo -e "${GREEN}[✓] Cloudflare WARP has been removed.${NC}"
+# Extracts a field from the WireGuard profile (simple, no external deps).
+profile_get() {
+    local key="$1"
+    grep -m1 "^${key} = " "$WGCF_PROFILE" | sed -E "s/^${key} = //"
 }
 
-# ===================== Cloudflare IP Change Options ==========================
-
-warp_change_ip_quick() {
-    if ! warp_is_installed; then
-        echo -e "${RED}[ERROR] WARP is not installed.${NC}"
+show_xray_outbound() {
+    if [[ ! -f "$WGCF_PROFILE" ]]; then
+        echo -e "${RED}[ERROR] No profile found at ${WGCF_PROFILE}. Run option 3 (generate) first.${NC}"
         return 1
     fi
 
-    ensure_warp_service
+    local private_key addresses dns
+    private_key=$(profile_get "PrivateKey")
+    addresses=$(profile_get "Address")
+    dns=$(profile_get "DNS")
 
-    echo -e "${CYAN}[*] Changing Cloudflare IP (quick reconnect)...${NC}"
-    local old_ip new_ip
-    old_ip=$(get_warp_ip)
-    echo -e "Current IP: ${YELLOW}${old_ip:-N/A}${NC}"
-
-    for attempt in {1..3}; do
-        echo -e "Attempt ${attempt}/3 ..."
-        warp_disconnect
-        warp-cli connect
-        sleep 3
-
-        new_ip=$(get_warp_ip)
-        if [[ -n "$new_ip" && "$new_ip" != "$old_ip" ]]; then
-            echo -e "${GREEN}[✓] IP changed successfully! New IP: $new_ip${NC}"
-            return 0
-        fi
-        sleep 2
-    done
-
-    echo -e "${YELLOW}[!] IP did not change after quick reconnect attempts.${NC}"
-    echo -e "${YELLOW}[>] Try 'Change IP (New Identity)' for a stronger change.${NC}"
-    return 2
-}
-
-warp_change_ip_new_identity() {
-    if ! warp_is_installed; then
-        echo -e "${RED}[ERROR] WARP is not installed.${NC}"
+    if [[ -z "$private_key" || -z "$addresses" ]]; then
+        echo -e "${RED}[ERROR] Could not parse PrivateKey/Address from ${WGCF_PROFILE}.${NC}"
+        echo -e "${YELLOW}[>] Raw file contents:${NC}"
+        cat "$WGCF_PROFILE"
         return 1
     fi
 
-    ensure_warp_service
+    # Split "172.16.0.2/32, 2606:xxxx::2/128" into a JSON array of two strings.
+    local addr_json
+    addr_json=$(echo "$addresses" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | \
+        awk '{printf "%s\"%s\"", (NR>1?",":""), $0}')
 
-    echo -e "${CYAN}[*] Creating a NEW Cloudflare WARP identity (new registration)...${NC}"
-    local old_ip new_ip
-    old_ip=$(get_warp_ip)
-    echo -e "Old IP: ${YELLOW}${old_ip:-N/A}${NC}"
+    echo -e "${CYAN}=====================================================================${NC}"
+    echo -e "${GREEN}Paste this as a NEW OUTBOUND inside x-ui's Xray Configuration JSON${NC}"
+    echo -e "${GREEN}(inside the top-level \"outbounds\": [ ... ] array, alongside your${NC}"
+    echo -e "${GREEN}existing \"freedom\"/\"blackhole\" outbounds — do not replace the array,${NC}"
+    echo -e "${GREEN}just add this object to it):${NC}"
+    echo -e "${CYAN}=====================================================================${NC}"
+    cat <<EOF
+{
+  "tag": "warp-out",
+  "protocol": "wireguard",
+  "settings": {
+    "secretKey": "${private_key}",
+    "address": [${addr_json}],
+    "peers": [
+      {
+        "publicKey": "${CF_PEER_PUBKEY}",
+        "endpoint": "${CF_ENDPOINT}",
+        "allowedIPs": ["0.0.0.0/0", "::/0"]
+      }
+    ],
+    "mtu": 1280,
+    "kernelMode": false
+  }
+}
+EOF
+    echo -e "${CYAN}=====================================================================${NC}"
+    echo -e "${YELLOW}[>] Then add a routing rule so your chosen inbound uses it, e.g.:${NC}"
+    cat <<'EOF'
+{
+  "type": "field",
+  "inboundTag": ["YOUR-INBOUND-TAG-HERE"],
+  "outboundTag": "warp-out"
+}
+EOF
+    echo -e "${CYAN}=====================================================================${NC}"
+    echo -e "${YELLOW}[>] Send me your current Xray Configuration JSON and I'll merge these${NC}"
+    echo -e "${YELLOW}    in for you precisely instead of doing it by hand.${NC}"
+}
 
-    warp_disconnect
+# ===================== Optional: real end-to-end test =======================
+# This does NOT touch x-ui. It brings up a throwaway wg-quick interface using
+# the generated profile, tests connectivity through it, then tears it back
+# down — so you know the credentials work before touching the panel at all.
 
-    echo -e "${YELLOW}[*] Deleting current WARP registration (if any)...${NC}"
-    warp-cli registration delete 2>/dev/null || \
-    warp-cli registration new --force 2>/dev/null || \
-    echo -e "${YELLOW}[!] Could not fully delete old registration (continuing).${NC}"
+wg_test_connection() {
+    if [[ ! -f "$WGCF_PROFILE" ]]; then
+        echo -e "${RED}[ERROR] No profile found. Run option 3 (generate) first.${NC}"
+        return 1
+    fi
+
+    if ! command -v wg-quick &>/dev/null; then
+        echo -e "${CYAN}[*] Installing wireguard-tools...${NC}"
+        apt-get update && apt-get install -y wireguard-tools resolvconf 2>/dev/null || \
+        apt-get install -y wireguard-tools 2>/dev/null
+    fi
+
+    local test_conf="/etc/wireguard/wgcf-test.conf"
+    cp "$WGCF_PROFILE" "$test_conf"
+
+    echo -e "${CYAN}[*] Bringing up a temporary WireGuard interface (wgcf-test)...${NC}"
+    if ! wg-quick up wgcf-test 2>&1; then
+        echo -e "${RED}[!] Failed to bring up the interface. See the error above.${NC}"
+        rm -f "$test_conf"
+        return 1
+    fi
 
     sleep 2
+    echo -e "${CYAN}[*] Testing connectivity through the tunnel...${NC}"
+    local ip
+    ip=$(curl -s --max-time 8 --interface wgcf-test https://api4.ipify.org 2>/dev/null)
 
-    echo -e "${CYAN}[*] Registering a brand new WARP account...${NC}"
-    warp-cli registration new
-    warp_set_proxy_mode
-    warp-cli connect
-    sleep 4
-
-    new_ip=$(get_warp_ip)
-    if [[ -n "$new_ip" ]]; then
-        if [[ "$new_ip" != "$old_ip" ]]; then
-            echo -e "${GREEN}[✓] New identity created successfully! New IP: $new_ip${NC}"
-        else
-            echo -e "${YELLOW}[!] New identity created, but IP appears the same. Try again later.${NC}"
-        fi
+    if [[ -n "$ip" ]]; then
+        echo -e "${GREEN}[✓] Success! Exit IP through WARP WireGuard tunnel: ${ip}${NC}"
+        echo -e "${GREEN}[✓] Your wgcf credentials are valid and working. Safe to paste into x-ui.${NC}"
     else
-        echo -e "${RED}[!] Failed to obtain new IP address after registration.${NC}"
+        echo -e "${RED}[!] Tunnel came up but no response through it — check firewall/MTU.${NC}"
     fi
+
+    echo -e "${CYAN}[*] Tearing down the test interface (does not affect x-ui)...${NC}"
+    wg-quick down wgcf-test 2>/dev/null
+    rm -f "$test_conf"
+}
+
+show_profile() {
+    if [[ ! -f "$WGCF_PROFILE" ]]; then
+        echo -e "${RED}[ERROR] No profile found. Run option 3 (generate) first.${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}===== ${WGCF_PROFILE} =====${NC}"
+    cat "$WGCF_PROFILE"
+}
+
+wgcf_status() {
+    if ! wgcf_is_installed; then
+        echo -e "${RED}[ERROR] wgcf is not installed yet.${NC}"
+        return 1
+    fi
+    if [[ ! -f "$WGCF_ACCOUNT" ]]; then
+        echo -e "${YELLOW}[INFO] No account registered yet.${NC}"
+        return 0
+    fi
+    (cd "$WORKDIR" && "$WGCF_BIN" status)
 }
 
 # ===================== Menu UI ==============================================
@@ -456,72 +306,62 @@ warp_change_ip_new_identity() {
 draw_menu() {
     clear
     echo "=================================================================="
-    echo "                Cloudflare WARP Proxy Manager v$VERSION"
-    echo "                        by Parham Pahlevan"
+    echo "        WARP -> Xray (x-ui) WireGuard Outbound Setup v$VERSION"
     echo "=================================================================="
-
-    local status="NOT INSTALLED"
-    local status_color=$YELLOW
-    local ip="N/A"
-
-    if warp_is_installed; then
-        if warp_is_connected; then
-            status="CONNECTED"
-            status_color=$GREEN
-            ip=$(get_warp_ip || echo "N/A")
-        else
-            status="DISCONNECTED"
-            status_color=$RED
-        fi
+    local wgcf_state="NOT INSTALLED"
+    local wgcf_color=$YELLOW
+    if wgcf_is_installed; then
+        wgcf_state="INSTALLED"
+        wgcf_color=$GREEN
     fi
+    local account_state="NOT REGISTERED"
+    local account_color=$YELLOW
+    [[ -f "$WGCF_ACCOUNT" ]] && { account_state="REGISTERED"; account_color=$GREEN; }
+    local profile_state="NOT GENERATED"
+    local profile_color=$YELLOW
+    [[ -f "$WGCF_PROFILE" ]] && { profile_state="GENERATED"; profile_color=$GREEN; }
 
-    echo -e "Status       : ${status_color}$status${NC}"
-    echo -e "Proxy        : 127.0.0.1:10808 (SOCKS5)"
-    echo -e "IP (via WARP): ${GREEN}$ip${NC}"
+    echo -e "wgcf binary : ${wgcf_color}${wgcf_state}${NC}"
+    echo -e "WARP account: ${account_color}${account_state}${NC}"
+    echo -e "WG profile  : ${profile_color}${profile_state}${NC}"
     echo "------------------------------------------------------------------"
     echo -e "${YELLOW}OPTIONS:${NC}"
-    echo "  1) Install / Reinstall Cloudflare WARP"
-    echo "  2) Connect WARP"
-    echo "  3) Disconnect WARP"
-    echo "  4) Show Status"
-    echo "  5) Test Proxy Connection"
-    echo "  6) Change IP (Quick Reconnect)"
-    echo "  7) Change IP (New Identity / New Registration)"
-    echo "  8) Remove Cloudflare WARP"
-    echo "  9) Fix MTU (1350) + persist on reboot"
-    echo " 10) Fix broken-IPv6 issue (blackhole Cloudflare IPv6, keep MASQUE)"
-    echo " 11) Reset tunnel endpoint to Cloudflare default"
+    echo "  1) Install / update wgcf"
+    echo "  2) Register a free WARP account"
+    echo "  3) Generate WireGuard profile"
+    echo "  4) Show ready-to-paste Xray outbound JSON"
+    echo "  5) Show raw wgcf-profile.conf"
+    echo "  6) Test the WireGuard tunnel directly (does not touch x-ui)"
+    echo "  7) Show wgcf account status"
+    echo "  8) Run steps 1-4 in one go (quick setup)"
     echo "  0) Exit"
     echo "=================================================================="
-    echo -ne "${YELLOW}Select an option [0-11]: ${NC}"
+    echo -ne "${YELLOW}Select an option [0-8]: ${NC}"
 }
 
 main_menu() {
     while true; do
         draw_menu
         read -r choice
-
         case "$choice" in
-            1) warp_install ;;
-            2) warp_connect ;;
-            3) warp_disconnect ;;
-            4) warp_status ;;
-            5) warp_test_proxy ;;
-            6) warp_change_ip_quick ;;
-            7) warp_change_ip_new_identity ;;
-            8) warp_remove ;;
-            9) warp_fix_mtu ;;
-            10) warp_fix_ipv6_issue ;;
-            11) warp_reset_endpoint ;;
+            1) install_wgcf ;;
+            2) wgcf_do_register ;;
+            3) wgcf_do_generate ;;
+            4) show_xray_outbound ;;
+            5) show_profile ;;
+            6) wg_test_connection ;;
+            7) wgcf_status ;;
+            8)
+                install_wgcf && wgcf_do_register && wgcf_do_generate && show_xray_outbound
+                ;;
             0)
                 echo -e "${GREEN}Goodbye!${NC}"
                 exit 0
                 ;;
             *)
-                echo -e "${RED}[!] Invalid option. Please choose 0-11.${NC}"
+                echo -e "${RED}[!] Invalid option. Please choose 0-8.${NC}"
                 ;;
         esac
-
         if [[ "$choice" != "0" ]]; then
             echo
             echo -e "${YELLOW}Press Enter to return to the menu...${NC}"
@@ -529,7 +369,5 @@ main_menu() {
         fi
     done
 }
-
-# ===================== Start Program ========================================
 
 main_menu
