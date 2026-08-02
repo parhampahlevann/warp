@@ -42,13 +42,25 @@ setup_foreign() {
   install_prereqs
   enable_bbr
 
-  echo "==> Generating Reality keypair (X25519) ..."
-  KEYS=$(/usr/local/bin/xray x25519)
-  PRIVATE_KEY=$(echo "$KEYS" | awk '/Private key:/ {print $3}')
-  PUBLIC_KEY=$(echo "$KEYS" | awk '/Public key:/ {print $3}')
+  echo ""
+  echo "For multi-IP failover, every foreign server must share the SAME Reality"
+  echo "keys/UUID so the Iran client can treat them as interchangeable."
+  read -rp "Is this an ADDITIONAL failover server reusing existing keys? (y/n): " REUSE
 
-  UUID=$(/usr/local/bin/xray uuid)
-  SHORT_ID=$(openssl rand -hex 8)
+  if [[ "$REUSE" =~ ^[Yy]$ ]]; then
+    read -rp "Existing UUID: " UUID
+    read -rp "Existing PRIVATE_KEY: " PRIVATE_KEY
+    read -rp "Existing PUBLIC_KEY: " PUBLIC_KEY
+    read -rp "Existing SHORT_ID: " SHORT_ID
+  else
+    echo "==> Generating Reality keypair (X25519) ..."
+    KEYS=$(/usr/local/bin/xray x25519)
+    PRIVATE_KEY=$(echo "$KEYS" | awk '/Private key:/ {print $3}')
+    PUBLIC_KEY=$(echo "$KEYS" | awk '/Public key:/ {print $3}')
+
+    UUID=$(/usr/local/bin/xray uuid)
+    SHORT_ID=$(openssl rand -hex 8)
+  fi
 
   mkdir -p /usr/local/etc/xray
 
@@ -104,6 +116,7 @@ EOF
 SERVER_IP=${SERVER_IP}
 PORT=${REALITY_PORT}
 UUID=${UUID}
+PRIVATE_KEY=${PRIVATE_KEY}
 PUBLIC_KEY=${PUBLIC_KEY}
 SHORT_ID=${SHORT_ID}
 SNI=${MASQ_DOMAIN}
@@ -116,6 +129,9 @@ EOF
   echo "------------------------------------------------------------------"
   cat /root/reality-info.txt
   echo "=================================================================="
+  echo " To add ANOTHER failover server: run this script (option 1) on the new"
+  echo " server, choose 'y' when asked to reuse keys, and paste the UUID/"
+  echo " PRIVATE_KEY/PUBLIC_KEY/SHORT_ID shown above."
   echo " (also saved to /root/reality-info.txt)"
 }
 
@@ -123,11 +139,20 @@ EOF
 # IRAN SERVER MODE
 # ------------------------------------------------------------
 setup_iran() {
-  read -rp "Foreign server IP: " SERVER_IP
-  read -rp "UUID: " UUID
-  read -rp "PUBLIC_KEY: " PUBLIC_KEY
-  read -rp "SHORT_ID: " SHORT_ID
+  read -rp "Foreign server IP(s), comma-separated for failover (e.g. 1.2.3.4,5.6.7.8): " SERVERS_RAW
+  read -rp "UUID (same on all foreign servers): " UUID
+  read -rp "PUBLIC_KEY (same on all foreign servers): " PUBLIC_KEY
+  read -rp "SHORT_ID (same on all foreign servers): " SHORT_ID
   read -rp "Ports you want tunneled, comma-separated (e.g. 1080,443,23902,8080): " PORTS_RAW
+
+  IFS=',' read -ra SERVER_ARRAY <<< "$SERVERS_RAW"
+  for i in "${!SERVER_ARRAY[@]}"; do
+    SERVER_ARRAY[$i]=$(echo "${SERVER_ARRAY[$i]}" | tr -d '[:space:]')
+  done
+  if [ "${#SERVER_ARRAY[@]}" -eq 0 ]; then
+    echo "No foreign server IP entered. Aborting."
+    exit 1
+  fi
 
   IFS=',' read -ra PORT_ARRAY <<< "$PORTS_RAW"
   for i in "${!PORT_ARRAY[@]}"; do
@@ -164,50 +189,83 @@ setup_iran() {
       }]')
   done
 
+  # build one reality outbound per foreign server (all sharing the same keys)
+  OUTBOUNDS_JSON="[]"
+  for idx in "${!SERVER_ARRAY[@]}"; do
+    SIP="${SERVER_ARRAY[$idx]}"
+    TAG="reality-out-$((idx+1))"
+    OUTBOUNDS_JSON=$(echo "$OUTBOUNDS_JSON" | jq \
+      --arg ip "$SIP" \
+      --argjson port "$REALITY_PORT" \
+      --arg uuid "$UUID" \
+      --arg sni "$MASQ_DOMAIN" \
+      --arg pubkey "$PUBLIC_KEY" \
+      --arg shortid "$SHORT_ID" \
+      --arg tag "$TAG" \
+      '. + [{
+        "protocol": "vless",
+        "tag": $tag,
+        "settings": {
+          "vnext": [
+            {
+              "address": $ip,
+              "port": $port,
+              "users": [
+                { "id": $uuid, "flow": "xtls-rprx-vision", "encryption": "none" }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "show": false,
+            "fingerprint": "chrome",
+            "serverName": $sni,
+            "publicKey": $pubkey,
+            "shortId": $shortid
+          },
+          "sockopt": { "tcpFastOpen": true }
+        }
+      }]')
+  done
+
   mkdir -p /usr/local/etc/xray
 
   jq -n \
     --argjson inbounds "$INBOUNDS_JSON" \
-    --arg server_ip "$SERVER_IP" \
-    --argjson reality_port "$REALITY_PORT" \
-    --arg uuid "$UUID" \
-    --arg sni "$MASQ_DOMAIN" \
-    --arg pubkey "$PUBLIC_KEY" \
-    --arg shortid "$SHORT_ID" \
+    --argjson outbounds "$OUTBOUNDS_JSON" \
+    --argjson multi "$([ "${#SERVER_ARRAY[@]}" -gt 1 ] && echo true || echo false)" \
     '{
       "log": { "loglevel": "warning" },
       "inbounds": $inbounds,
-      "outbounds": [
-        {
-          "protocol": "vless",
-          "tag": "reality-out",
-          "settings": {
-            "vnext": [
-              {
-                "address": $server_ip,
-                "port": $reality_port,
-                "users": [
-                  { "id": $uuid, "flow": "xtls-rprx-vision", "encryption": "none" }
-                ]
-              }
-            ]
-          },
-          "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "realitySettings": {
-              "show": false,
-              "fingerprint": "chrome",
-              "serverName": $sni,
-              "publicKey": $pubkey,
-              "shortId": $shortid
-            },
-            "sockopt": { "tcpFastOpen": true }
-          }
+      "outbounds": ($outbounds + [{ "protocol": "freedom", "tag": "direct" }])
+    }
+    + (if $multi then {
+        "observatory": {
+          "subjectSelector": ["reality-out"],
+          "probeUrl": "https://www.gstatic.com/generate_204",
+          "probeInterval": "10s",
+          "enableConcurrency": true
         },
-        { "protocol": "freedom", "tag": "direct" }
-      ]
-    }' > /usr/local/etc/xray/config.json
+        "routing": {
+          "domainStrategy": "AsIs",
+          "balancers": [
+            { "tag": "auto-failover", "selector": ["reality-out"], "strategy": { "type": "leastPing" } }
+          ],
+          "rules": [
+            { "type": "field", "network": "tcp,udp", "balancerTag": "auto-failover" }
+          ]
+        }
+      } else {
+        "routing": {
+          "domainStrategy": "AsIs",
+          "rules": [
+            { "type": "field", "network": "tcp,udp", "outboundTag": "reality-out-1" }
+          ]
+        }
+      } end)' > /usr/local/etc/xray/config.json
 
   echo "==> Opening firewall ports ..."
   for PORT in "${PORT_ARRAY[@]}"; do
@@ -226,7 +284,7 @@ setup_iran() {
 
   cat > /root/proxy-info.txt <<EOF
 IRAN_IP=${IRAN_IP}
-FOREIGN_IP=${SERVER_IP}
+FOREIGN_IPS=${SERVERS_RAW}
 PORTS=${PORTS_RAW}
 USER=${PROXY_USER}
 PASS=${PROXY_PASS}
@@ -234,7 +292,14 @@ EOF
 
   echo ""
   echo "=================================================================="
-  echo " Iran server setup complete. Tunnel to ${SERVER_IP} is up."
+  echo " Iran server setup complete."
+  if [ "${#SERVER_ARRAY[@]}" -gt 1 ]; then
+    echo " Auto-failover enabled across ${#SERVER_ARRAY[@]} foreign servers: ${SERVERS_RAW}"
+    echo " Xray will automatically route through whichever one has the lowest ping"
+    echo " and is currently reachable (checked every 10s)."
+  else
+    echo " Tunnel to ${SERVERS_RAW} is up."
+  fi
   echo "------------------------------------------------------------------"
   echo " SOCKS5 ports open on ${IRAN_IP}: ${PORTS_RAW}"
   echo " Username : ${PROXY_USER}"
@@ -288,10 +353,10 @@ check_status() {
     if [ "$CODE" == "200" ]; then
       echo " Tunnel test  : SUCCESS"
       echo " Exit IP seen : ${EXIT_IP}"
-      if [ "${EXIT_IP}" == "${FOREIGN_IP:-}" ]; then
-        echo " Exit IP matches foreign server IP -> tunnel confirmed working correctly."
+      if echo "${FOREIGN_IPS:-}" | tr ',' '\n' | grep -qx "${EXIT_IP}"; then
+        echo " Exit IP matches one of the configured foreign servers -> tunnel confirmed working correctly."
       else
-        echo " NOTE: exit IP differs from stored FOREIGN_IP (${FOREIGN_IP:-unknown}) - check config."
+        echo " NOTE: exit IP is not in the configured list (${FOREIGN_IPS:-unknown}) - check config."
       fi
       echo " Round-trip time : ${TIME}s"
     else
