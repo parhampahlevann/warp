@@ -35,6 +35,63 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 }
 
+KEYSHARE_PORT=18888
+
+# Serves ONLY {UUID, PUBLIC_KEY, SHORT_ID, PORT, SNI} - never the private key -
+# on a fixed port, for a maximum of 10 minutes or until the first successful
+# fetch, whichever comes first. Then closes itself and the firewall port.
+share_keys_temporarily() {
+  mkdir -p /tmp/reality-share
+  cat > /tmp/reality-share/reality-info-public.txt <<EOF
+SERVER_IP=${SERVER_IP}
+PORT=${REALITY_PORT}
+UUID=${UUID}
+PUBLIC_KEY=${PUBLIC_KEY}
+SHORT_ID=${SHORT_ID}
+SNI=${MASQ_DOMAIN}
+EOF
+
+  ufw allow ${KEYSHARE_PORT}/tcp >/dev/null 2>&1 || true
+
+  nohup python3 - <<'PYEOF' >/tmp/reality-share/server.log 2>&1 &
+import http.server, socketserver, threading, time, os
+
+PORT = 18888
+DIRECTORY = "/tmp/reality-share"
+os.chdir(DIRECTORY)
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        super().do_GET()
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+    def log_message(self, *a):
+        pass
+
+httpd = socketserver.TCPServer(("0.0.0.0", PORT), Handler)
+
+def auto_expire():
+    time.sleep(600)
+    try:
+        httpd.shutdown()
+    except Exception:
+        pass
+
+threading.Thread(target=auto_expire, daemon=True).start()
+httpd.serve_forever()
+PYEOF
+  SERVER_PID=$!
+  disown "$SERVER_PID"
+
+  ( wait "$SERVER_PID" 2>/dev/null
+    ufw delete allow ${KEYSHARE_PORT}/tcp >/dev/null 2>&1 || true
+    rm -rf /tmp/reality-share
+  ) &
+  disown
+
+  echo " Key-sharing service started on port ${KEYSHARE_PORT}."
+  echo " It will close automatically after the first successful fetch, or in 10 minutes."
+}
+
 # ------------------------------------------------------------
 # FOREIGN SERVER MODE
 # ------------------------------------------------------------
@@ -125,14 +182,17 @@ EOF
   echo ""
   echo "=================================================================="
   echo " Foreign server setup complete."
-  echo " Copy this info - you'll need it when running this script on the Iran server:"
   echo "------------------------------------------------------------------"
   cat /root/reality-info.txt
   echo "=================================================================="
-  echo " To add ANOTHER failover server: run this script (option 1) on the new"
-  echo " server, choose 'y' when asked to reuse keys, and paste the UUID/"
-  echo " PRIVATE_KEY/PUBLIC_KEY/SHORT_ID shown above."
   echo " (also saved to /root/reality-info.txt)"
+
+  share_keys_temporarily
+
+  echo ""
+  echo " >>> Now go set up the Iran server (option 2) - it only needs this"
+  echo " >>> server's IP (${SERVER_IP}) and will fetch everything else automatically"
+  echo " >>> within the next 10 minutes."
 }
 
 # ------------------------------------------------------------
@@ -140,9 +200,6 @@ EOF
 # ------------------------------------------------------------
 setup_iran() {
   read -rp "Foreign server IP(s), comma-separated for failover (e.g. 1.2.3.4,5.6.7.8): " SERVERS_RAW
-  read -rp "UUID (same on all foreign servers): " UUID
-  read -rp "PUBLIC_KEY (same on all foreign servers): " PUBLIC_KEY
-  read -rp "SHORT_ID (same on all foreign servers): " SHORT_ID
   read -rp "Ports you want tunneled, comma-separated (e.g. 1080,443,23902,8080): " PORTS_RAW
 
   IFS=',' read -ra SERVER_ARRAY <<< "$SERVERS_RAW"
@@ -163,6 +220,35 @@ setup_iran() {
     echo "No ports entered. Aborting."
     exit 1
   fi
+
+  echo "==> Installing curl ..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null 2>&1
+  apt-get install -y curl >/dev/null 2>&1
+
+  # All foreign servers in the failover list share identical Reality keys
+  # (enforced by the "reuse keys" step during their setup), so we only need
+  # to auto-fetch the public info from the FIRST one in the list.
+  PRIMARY_IP="${SERVER_ARRAY[0]}"
+  echo "==> Fetching Reality credentials from ${PRIMARY_IP}:${KEYSHARE_PORT} ..."
+  REMOTE_INFO="/tmp/reality-info-remote.txt"
+  rm -f "$REMOTE_INFO"
+
+  if ! curl -fsS -m 15 "http://${PRIMARY_IP}:${KEYSHARE_PORT}/reality-info-public.txt" -o "$REMOTE_INFO"; then
+    echo ""
+    echo "Could not fetch credentials from ${PRIMARY_IP}."
+    echo "This means the 10-minute key-sharing window on that server has already"
+    echo "closed (or the foreign setup wasn't run there yet)."
+    echo "Fix: on the foreign server, run this script again and choose option 6"
+    echo "(Re-share Reality keys) to reopen the window for 10 more minutes, then"
+    echo "re-run this Iran setup right away."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$REMOTE_INFO"
+  echo "==> Got UUID / PUBLIC_KEY / SHORT_ID automatically. No manual entry needed."
+  rm -f "$REMOTE_INFO"
 
   install_prereqs
   enable_bbr
@@ -405,6 +491,22 @@ uninstall_tunnel() {
 }
 
 # ------------------------------------------------------------
+# RE-SHARE KEYS (foreign server only - reopens the 10-min window
+# without regenerating keys, useful if it expired before the Iran
+# side could fetch it)
+# ------------------------------------------------------------
+reshare_keys() {
+  if [ ! -f /root/reality-info.txt ]; then
+    echo "No foreign-server install found on this machine (reality-info.txt missing)."
+    return
+  fi
+  # shellcheck disable=SC1090
+  source /root/reality-info.txt
+  echo "==> Reopening key-sharing window for 10 minutes on port ${KEYSHARE_PORT} ..."
+  share_keys_temporarily
+}
+
+# ------------------------------------------------------------
 # MENU
 # ------------------------------------------------------------
 echo "What do you want to do?"
@@ -413,7 +515,8 @@ echo "  2) Install - Iran server (Reality client + forwarded ports)"
 echo "  3) Check tunnel status / test connection"
 echo "  4) Uninstall"
 echo "  5) Exit"
-read -rp "Enter a number (1-5): " MODE
+echo "  6) Re-share Reality keys (foreign server, if the 10-min window expired)"
+read -rp "Enter a number (1-6): " MODE
 
 case "$MODE" in
   1) setup_foreign ;;
@@ -421,5 +524,6 @@ case "$MODE" in
   3) check_status ;;
   4) uninstall_tunnel ;;
   5) echo "Bye." ; exit 0 ;;
+  6) reshare_keys ;;
   *) echo "Invalid option." ; exit 1 ;;
 esac
