@@ -242,21 +242,32 @@ setup_iran() {
   REMOTE_INFO="/tmp/reality-info-remote.txt"
   rm -f "$REMOTE_INFO"
 
-  if ! curl -fsS -m 15 "http://${SERVER_IP}:${KEYSHARE_PORT}/reality-info-public.txt" -o "$REMOTE_INFO"; then
-    echo ""
-    echo "Could not fetch credentials from ${SERVER_IP}."
-    echo "This means the 10-minute key-sharing window on that server has already"
-    echo "closed (or the foreign setup wasn't run there yet)."
-    echo "Fix: on the foreign server, run this script again and choose option 6"
-    echo "(Re-share Reality keys) to reopen the window for 10 more minutes, then"
-    echo "re-run this Iran setup right away."
-    exit 1
+  FETCH_OK=false
+  if curl -fsS -m 15 "http://${SERVER_IP}:${KEYSHARE_PORT}/reality-info-public.txt" -o "$REMOTE_INFO" 2>/dev/null; then
+    # Guard against a captive portal / firewall block page that returns HTTP 200
+    # with an HTML body instead of our plain-text file.
+    if [ -s "$REMOTE_INFO" ] && ! grep -q '<' "$REMOTE_INFO" && grep -q '^UUID=' "$REMOTE_INFO"; then
+      FETCH_OK=true
+    fi
   fi
 
-  # shellcheck disable=SC1090
-  source "$REMOTE_INFO"
-  echo "==> Got UUID / PUBLIC_KEY / SHORT_ID automatically. No manual entry needed."
-  rm -f "$REMOTE_INFO"
+  if [ "$FETCH_OK" = true ]; then
+    # shellcheck disable=SC1090
+    source "$REMOTE_INFO"
+    echo "==> Got UUID / PUBLIC_KEY / SHORT_ID automatically. No manual entry needed."
+    rm -f "$REMOTE_INFO"
+  else
+    echo ""
+    echo "Automatic fetch failed (either the key-sharing window on ${SERVER_IP} has"
+    echo "closed, wasn't started, or something on the network blocked port ${KEYSHARE_PORT})."
+    echo "Falling back to manual entry - run this on the FOREIGN server to get these:"
+    echo "  cat /root/reality-info.txt"
+    echo ""
+    read -rp "UUID: " UUID
+    read -rp "PUBLIC_KEY: " PUBLIC_KEY
+    read -rp "SHORT_ID: " SHORT_ID
+    rm -f "$REMOTE_INFO"
+  fi
 
   install_prereqs
   enable_bbr
