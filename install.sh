@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Xray VLESS + REALITY - UNIFIED SETUP SCRIPT (single-server model)
+#  Xray VLESS + REALITY - SIMPLE, RELIABLE SETUP SCRIPT
 #  Works on any Ubuntu version (18.04 / 20.04 / 22.04 / 24.04)
 # ============================================================
 set -euo pipefail
 
 REALITY_PORT=443                  # standard HTTPS port -> less suspicious than a custom port
 MASQ_DOMAIN="www.microsoft.com"   # domain the traffic will masquerade as
-KEYSHARE_PORT=18888
 
-# ------------------------------------------------------------
-# Shared helpers
-# ------------------------------------------------------------
 install_prereqs() {
   echo "==> Updating system and installing prerequisites ..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl unzip jq openssl cron ufw python3
+  apt-get install -y curl unzip jq openssl cron ufw
 
   echo "==> Installing Xray-core (latest official release) ..."
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
@@ -35,9 +31,6 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 }
 
-# Robustly detect this machine's public IPv4 - tries several services,
-# uses -f so an HTTP error page never gets mistaken for a real IP, and
-# validates the result looks like an actual IPv4 address.
 detect_public_ip() {
   local ip=""
   for url in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com" "https://ident.me"; do
@@ -50,64 +43,8 @@ detect_public_ip() {
   return 1
 }
 
-# Serves ONLY {SERVER_IP, PORT, UUID, PUBLIC_KEY, SHORT_ID, SNI} - never the
-# private key - on a fixed port, for a maximum of 10 minutes or until the
-# first successful fetch, whichever comes first. Then shuts itself down and
-# closes the firewall port.
-share_keys_temporarily() {
-  mkdir -p /tmp/reality-share
-  cat > /tmp/reality-share/reality-info-public.txt <<EOF
-SERVER_IP=${SERVER_IP}
-PORT=${REALITY_PORT}
-UUID=${UUID}
-PUBLIC_KEY=${PUBLIC_KEY}
-SHORT_ID=${SHORT_ID}
-SNI=${MASQ_DOMAIN}
-EOF
-
-  ufw allow ${KEYSHARE_PORT}/tcp >/dev/null 2>&1 || true
-
-  nohup python3 - <<PYEOF >/tmp/reality-share/server.log 2>&1 &
-import http.server, socketserver, threading, time, os
-
-PORT = ${KEYSHARE_PORT}
-DIRECTORY = "/tmp/reality-share"
-os.chdir(DIRECTORY)
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        super().do_GET()
-        threading.Thread(target=httpd.shutdown, daemon=True).start()
-    def log_message(self, *a):
-        pass
-
-httpd = socketserver.TCPServer(("0.0.0.0", PORT), Handler)
-
-def auto_expire():
-    time.sleep(600)
-    try:
-        httpd.shutdown()
-    except Exception:
-        pass
-
-threading.Thread(target=auto_expire, daemon=True).start()
-httpd.serve_forever()
-PYEOF
-  SERVER_PID=$!
-  disown "$SERVER_PID"
-
-  ( wait "$SERVER_PID" 2>/dev/null
-    ufw delete allow ${KEYSHARE_PORT}/tcp >/dev/null 2>&1 || true
-    rm -rf /tmp/reality-share
-  ) &
-  disown
-
-  echo " Key-sharing service started on port ${KEYSHARE_PORT}."
-  echo " It will close automatically after the first successful fetch, or in 10 minutes."
-}
-
 # ------------------------------------------------------------
-# FOREIGN SERVER MODE - fully automatic, asks nothing
+# FOREIGN SERVER MODE - asks nothing
 # ------------------------------------------------------------
 setup_foreign() {
   install_prereqs
@@ -128,12 +65,11 @@ setup_foreign() {
 
   echo "==> Detecting this server's public IP ..."
   SERVER_IP=$(detect_public_ip) || {
-    echo "ERROR: could not auto-detect the public IP (all lookup services failed/blocked)."
+    echo "Could not auto-detect the public IP."
     read -rp "Please enter this server's public IP manually: " SERVER_IP
   }
 
   mkdir -p /usr/local/etc/xray
-
   cat > /usr/local/etc/xray/config.json <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -199,28 +135,35 @@ EOF
   echo ""
   echo "=================================================================="
   echo " Foreign server setup complete. Xray is running."
-  echo " Server IP: ${SERVER_IP}"
-  echo "=================================================================="
-  echo " (full details saved to /root/reality-info.txt)"
-
-  share_keys_temporarily
-
+  echo "------------------------------------------------------------------"
+  echo " Copy these 3 values - the Iran server setup will ask for them:"
   echo ""
-  echo " >>> Now go set up the Iran server (option 2) - it only needs this"
-  echo " >>> server's IP (${SERVER_IP}) and will fetch everything else"
-  echo " >>> automatically within the next 10 minutes."
+  echo " Foreign IP : ${SERVER_IP}"
+  echo " UUID       : ${UUID}"
+  echo " PUBLIC_KEY : ${PUBLIC_KEY}"
+  echo " SHORT_ID   : ${SHORT_ID}"
+  echo "=================================================================="
+  echo " (also saved to /root/reality-info.txt on this server)"
 }
 
 # ------------------------------------------------------------
-# IRAN SERVER MODE - asks only for the foreign IP and ports
+# IRAN SERVER MODE - asks for the foreign IP, the 3 values above, and ports
 # ------------------------------------------------------------
 setup_iran() {
   read -rp "Foreign server IP: " SERVER_IP
+  read -rp "UUID (from the foreign server output): " UUID
+  read -rp "PUBLIC_KEY (from the foreign server output): " PUBLIC_KEY
+  read -rp "SHORT_ID (from the foreign server output): " SHORT_ID
   read -rp "Ports you want tunneled, comma-separated (e.g. 1080,443,23902,8080): " PORTS_RAW
 
   SERVER_IP=$(echo "$SERVER_IP" | tr -d '[:space:]')
-  if [ -z "$SERVER_IP" ]; then
-    echo "No foreign server IP entered. Aborting."
+  UUID=$(echo "$UUID" | tr -d '[:space:]')
+  PUBLIC_KEY=$(echo "$PUBLIC_KEY" | tr -d '[:space:]')
+  SHORT_ID=$(echo "$SHORT_ID" | tr -d '[:space:]')
+
+  if [ -z "$SERVER_IP" ] || [ -z "$UUID" ] || [ -z "$PUBLIC_KEY" ] || [ -z "$SHORT_ID" ]; then
+    echo "ERROR: one of SERVER_IP / UUID / PUBLIC_KEY / SHORT_ID is empty."
+    echo "Run this on the FOREIGN server first (option 1) and copy its output. Aborting."
     exit 1
   fi
 
@@ -231,42 +174,6 @@ setup_iran() {
   if [ "${#PORT_ARRAY[@]}" -eq 0 ]; then
     echo "No ports entered. Aborting."
     exit 1
-  fi
-
-  echo "==> Installing curl ..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null 2>&1
-  apt-get install -y curl >/dev/null 2>&1
-
-  echo "==> Fetching Reality credentials from ${SERVER_IP}:${KEYSHARE_PORT} ..."
-  REMOTE_INFO="/tmp/reality-info-remote.txt"
-  rm -f "$REMOTE_INFO"
-
-  FETCH_OK=false
-  if curl -fsS -m 15 "http://${SERVER_IP}:${KEYSHARE_PORT}/reality-info-public.txt" -o "$REMOTE_INFO" 2>/dev/null; then
-    # Guard against a captive portal / firewall block page that returns HTTP 200
-    # with an HTML body instead of our plain-text file.
-    if [ -s "$REMOTE_INFO" ] && ! grep -q '<' "$REMOTE_INFO" && grep -q '^UUID=' "$REMOTE_INFO"; then
-      FETCH_OK=true
-    fi
-  fi
-
-  if [ "$FETCH_OK" = true ]; then
-    # shellcheck disable=SC1090
-    source "$REMOTE_INFO"
-    echo "==> Got UUID / PUBLIC_KEY / SHORT_ID automatically. No manual entry needed."
-    rm -f "$REMOTE_INFO"
-  else
-    echo ""
-    echo "Automatic fetch failed (either the key-sharing window on ${SERVER_IP} has"
-    echo "closed, wasn't started, or something on the network blocked port ${KEYSHARE_PORT})."
-    echo "Falling back to manual entry - run this on the FOREIGN server to get these:"
-    echo "  cat /root/reality-info.txt"
-    echo ""
-    read -rp "UUID: " UUID
-    read -rp "PUBLIC_KEY: " PUBLIC_KEY
-    read -rp "SHORT_ID: " SHORT_ID
-    rm -f "$REMOTE_INFO"
   fi
 
   install_prereqs
@@ -374,6 +281,7 @@ EOF
   echo " Username : ${PROXY_USER}"
   echo " Password : ${PROXY_PASS}"
   echo "=================================================================="
+  echo " Test: curl -x socks5://${PROXY_USER}:${PROXY_PASS}@127.0.0.1:<PORT> https://ifconfig.me"
   echo " (also saved to /root/proxy-info.txt)"
 }
 
@@ -389,7 +297,7 @@ check_status() {
     if systemctl is-active --quiet xray; then
       echo " Xray service : RUNNING"
     else
-      echo " Xray service : NOT RUNNING  <-- problem, run: systemctl restart xray"
+      echo " Xray service : NOT RUNNING  <-- run: systemctl restart xray"
       return
     fi
     if ss -tln | grep -q ":${PORT} "; then
@@ -397,7 +305,6 @@ check_status() {
     else
       echo " Listening on port ${PORT} : NO  <-- problem"
     fi
-    echo " Recent log lines:"
     journalctl -u xray -n 5 --no-pager | sed 's/^/   /'
 
   elif [ -f /root/proxy-info.txt ]; then
@@ -408,34 +315,28 @@ check_status() {
     if systemctl is-active --quiet xray; then
       echo " Xray service : RUNNING"
     else
-      echo " Xray service : NOT RUNNING  <-- problem, run: systemctl restart xray"
+      echo " Xray service : NOT RUNNING  <-- run: systemctl restart xray"
       return
     fi
-
     FIRST_PORT=$(echo "$PORTS" | cut -d',' -f1)
     echo " Testing real tunnel traffic through port ${FIRST_PORT} ..."
     RESULT=$(curl -s -m 10 -w "\n__TIME__:%{time_total}\n__CODE__:%{http_code}" \
       -x "socks5://${USER}:${PASS}@127.0.0.1:${FIRST_PORT}" https://ifconfig.me 2>/dev/null || true)
-
     EXIT_IP=$(echo "$RESULT" | head -n1)
     TIME=$(echo "$RESULT" | grep "__TIME__" | cut -d':' -f2)
     CODE=$(echo "$RESULT" | grep "__CODE__" | cut -d':' -f2)
-
     if [ "$CODE" == "200" ]; then
       echo " Tunnel test  : SUCCESS"
       echo " Exit IP seen : ${EXIT_IP}"
       if [ "${EXIT_IP}" == "${FOREIGN_IP:-}" ]; then
-        echo " Exit IP matches the foreign server -> tunnel confirmed working correctly."
-      else
-        echo " NOTE: exit IP differs from stored FOREIGN_IP (${FOREIGN_IP:-unknown}) - check config."
+        echo " Exit IP matches the foreign server -> tunnel confirmed working."
       fi
       echo " Round-trip time : ${TIME}s"
     else
-      echo " Tunnel test  : FAILED (no response through the tunnel)"
-      echo " Check: systemctl status xray / journalctl -u xray -n 30"
+      echo " Tunnel test  : FAILED - check: journalctl -u xray -n 30"
     fi
   else
-    echo "No installation found on this server (neither reality-info.txt nor proxy-info.txt exists)."
+    echo "No installation found on this server."
   fi
 }
 
@@ -457,7 +358,6 @@ uninstall_tunnel() {
     # shellcheck disable=SC1090
     source /root/reality-info.txt
     ufw delete allow ${PORT}/tcp >/dev/null 2>&1 || true
-    ufw delete allow ${KEYSHARE_PORT}/tcp >/dev/null 2>&1 || true
     rm -f /root/reality-info.txt
   fi
 
@@ -472,25 +372,10 @@ uninstall_tunnel() {
   fi
 
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove >/dev/null 2>&1 || true
-  rm -rf /usr/local/etc/xray /tmp/reality-share
+  rm -rf /usr/local/etc/xray
   rm -f /etc/sysctl.d/99-tunnel-tuning.conf
 
-  echo "Uninstall complete. All tunnel components have been removed."
-}
-
-# ------------------------------------------------------------
-# RE-SHARE KEYS (foreign server only - reopens the 10-min window
-# without regenerating keys)
-# ------------------------------------------------------------
-reshare_keys() {
-  if [ ! -f /root/reality-info.txt ]; then
-    echo "No foreign-server install found on this machine (reality-info.txt missing)."
-    return
-  fi
-  # shellcheck disable=SC1090
-  source /root/reality-info.txt
-  echo "==> Reopening key-sharing window for 10 minutes on port ${KEYSHARE_PORT} ..."
-  share_keys_temporarily
+  echo "Uninstall complete."
 }
 
 # ------------------------------------------------------------
@@ -502,8 +387,7 @@ echo "  2) Install - Iran server (Reality client + forwarded ports)"
 echo "  3) Check tunnel status / test connection"
 echo "  4) Uninstall"
 echo "  5) Exit"
-echo "  6) Re-share Reality keys (foreign server, if the 10-min window expired)"
-read -rp "Enter a number (1-6): " MODE
+read -rp "Enter a number (1-5): " MODE
 
 case "$MODE" in
   1) setup_foreign ;;
@@ -511,6 +395,5 @@ case "$MODE" in
   3) check_status ;;
   4) uninstall_tunnel ;;
   5) echo "Bye." ; exit 0 ;;
-  6) reshare_keys ;;
   *) echo "Invalid option." ; exit 1 ;;
 esac
