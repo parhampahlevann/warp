@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Xray VLESS + REALITY - UNIFIED SETUP SCRIPT
-#  (Foreign server / Iran server)
+#  Xray VLESS + REALITY - UNIFIED SETUP SCRIPT (single-server model)
 #  Works on any Ubuntu version (18.04 / 20.04 / 22.04 / 24.04)
 # ============================================================
 set -euo pipefail
 
 REALITY_PORT=443                  # standard HTTPS port -> less suspicious than a custom port
 MASQ_DOMAIN="www.microsoft.com"   # domain the traffic will masquerade as
+KEYSHARE_PORT=18888
 
 # ------------------------------------------------------------
 # Shared helpers
@@ -16,7 +16,7 @@ install_prereqs() {
   echo "==> Updating system and installing prerequisites ..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl unzip jq openssl cron ufw
+  apt-get install -y curl unzip jq openssl cron ufw python3
 
   echo "==> Installing Xray-core (latest official release) ..."
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
@@ -35,11 +35,25 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 }
 
-KEYSHARE_PORT=18888
+# Robustly detect this machine's public IPv4 - tries several services,
+# uses -f so an HTTP error page never gets mistaken for a real IP, and
+# validates the result looks like an actual IPv4 address.
+detect_public_ip() {
+  local ip=""
+  for url in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com" "https://ident.me"; do
+    ip=$(curl -4 -fsS -m 8 "$url" 2>/dev/null | tr -d '[:space:]') || true
+    if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
 
-# Serves ONLY {UUID, PUBLIC_KEY, SHORT_ID, PORT, SNI} - never the private key -
-# on a fixed port, for a maximum of 10 minutes or until the first successful
-# fetch, whichever comes first. Then closes itself and the firewall port.
+# Serves ONLY {SERVER_IP, PORT, UUID, PUBLIC_KEY, SHORT_ID, SNI} - never the
+# private key - on a fixed port, for a maximum of 10 minutes or until the
+# first successful fetch, whichever comes first. Then shuts itself down and
+# closes the firewall port.
 share_keys_temporarily() {
   mkdir -p /tmp/reality-share
   cat > /tmp/reality-share/reality-info-public.txt <<EOF
@@ -53,10 +67,10 @@ EOF
 
   ufw allow ${KEYSHARE_PORT}/tcp >/dev/null 2>&1 || true
 
-  nohup python3 - <<'PYEOF' >/tmp/reality-share/server.log 2>&1 &
+  nohup python3 - <<PYEOF >/tmp/reality-share/server.log 2>&1 &
 import http.server, socketserver, threading, time, os
 
-PORT = 18888
+PORT = ${KEYSHARE_PORT}
 DIRECTORY = "/tmp/reality-share"
 os.chdir(DIRECTORY)
 
@@ -93,31 +107,30 @@ PYEOF
 }
 
 # ------------------------------------------------------------
-# FOREIGN SERVER MODE
+# FOREIGN SERVER MODE - fully automatic, asks nothing
 # ------------------------------------------------------------
 setup_foreign() {
   install_prereqs
   enable_bbr
 
-  echo ""
-  echo "For multi-IP failover, every foreign server must share the SAME Reality"
-  echo "keys/UUID so the Iran client can treat them as interchangeable."
-  read -rp "Is this an ADDITIONAL failover server reusing existing keys? (y/n): " REUSE
+  echo "==> Generating Reality keypair (X25519) ..."
+  KEYS=$(/usr/local/bin/xray x25519)
+  PRIVATE_KEY=$(echo "$KEYS" | grep -ioP 'private\s*key:\s*\K\S+')
+  PUBLIC_KEY=$(echo "$KEYS" | grep -ioP 'public\s*key:\s*\K\S+')
+  UUID=$(/usr/local/bin/xray uuid)
+  SHORT_ID=$(openssl rand -hex 8)
 
-  if [[ "$REUSE" =~ ^[Yy]$ ]]; then
-    read -rp "Existing UUID: " UUID
-    read -rp "Existing PRIVATE_KEY: " PRIVATE_KEY
-    read -rp "Existing PUBLIC_KEY: " PUBLIC_KEY
-    read -rp "Existing SHORT_ID: " SHORT_ID
-  else
-    echo "==> Generating Reality keypair (X25519) ..."
-    KEYS=$(/usr/local/bin/xray x25519)
-    PRIVATE_KEY=$(echo "$KEYS" | awk '/Private key:/ {print $3}')
-    PUBLIC_KEY=$(echo "$KEYS" | awk '/Public key:/ {print $3}')
-
-    UUID=$(/usr/local/bin/xray uuid)
-    SHORT_ID=$(openssl rand -hex 8)
+  if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    echo "ERROR: could not parse Xray x25519 key output. Raw output was:"
+    echo "$KEYS"
+    exit 1
   fi
+
+  echo "==> Detecting this server's public IP ..."
+  SERVER_IP=$(detect_public_ip) || {
+    echo "ERROR: could not auto-detect the public IP (all lookup services failed/blocked)."
+    read -rp "Please enter this server's public IP manually: " SERVER_IP
+  }
 
   mkdir -p /usr/local/etc/xray
 
@@ -166,8 +179,12 @@ EOF
   echo "==> Enabling and starting the service ..."
   systemctl enable xray >/dev/null 2>&1
   systemctl restart xray
-
-  SERVER_IP=$(curl -4 -s ifconfig.me || curl -4 -s icanhazip.com)
+  sleep 1
+  if ! systemctl is-active --quiet xray; then
+    echo "ERROR: xray failed to start. Log output:"
+    journalctl -u xray -n 30 --no-pager
+    exit 1
+  fi
 
   cat > /root/reality-info.txt <<EOF
 SERVER_IP=${SERVER_IP}
@@ -181,32 +198,28 @@ EOF
 
   echo ""
   echo "=================================================================="
-  echo " Foreign server setup complete."
-  echo "------------------------------------------------------------------"
-  cat /root/reality-info.txt
+  echo " Foreign server setup complete. Xray is running."
+  echo " Server IP: ${SERVER_IP}"
   echo "=================================================================="
-  echo " (also saved to /root/reality-info.txt)"
+  echo " (full details saved to /root/reality-info.txt)"
 
   share_keys_temporarily
 
   echo ""
   echo " >>> Now go set up the Iran server (option 2) - it only needs this"
-  echo " >>> server's IP (${SERVER_IP}) and will fetch everything else automatically"
-  echo " >>> within the next 10 minutes."
+  echo " >>> server's IP (${SERVER_IP}) and will fetch everything else"
+  echo " >>> automatically within the next 10 minutes."
 }
 
 # ------------------------------------------------------------
-# IRAN SERVER MODE
+# IRAN SERVER MODE - asks only for the foreign IP and ports
 # ------------------------------------------------------------
 setup_iran() {
-  read -rp "Foreign server IP(s), comma-separated for failover (e.g. 1.2.3.4,5.6.7.8): " SERVERS_RAW
+  read -rp "Foreign server IP: " SERVER_IP
   read -rp "Ports you want tunneled, comma-separated (e.g. 1080,443,23902,8080): " PORTS_RAW
 
-  IFS=',' read -ra SERVER_ARRAY <<< "$SERVERS_RAW"
-  for i in "${!SERVER_ARRAY[@]}"; do
-    SERVER_ARRAY[$i]=$(echo "${SERVER_ARRAY[$i]}" | tr -d '[:space:]')
-  done
-  if [ "${#SERVER_ARRAY[@]}" -eq 0 ]; then
+  SERVER_IP=$(echo "$SERVER_IP" | tr -d '[:space:]')
+  if [ -z "$SERVER_IP" ]; then
     echo "No foreign server IP entered. Aborting."
     exit 1
   fi
@@ -215,7 +228,6 @@ setup_iran() {
   for i in "${!PORT_ARRAY[@]}"; do
     PORT_ARRAY[$i]=$(echo "${PORT_ARRAY[$i]}" | tr -d '[:space:]')
   done
-
   if [ "${#PORT_ARRAY[@]}" -eq 0 ]; then
     echo "No ports entered. Aborting."
     exit 1
@@ -226,17 +238,13 @@ setup_iran() {
   apt-get update -y >/dev/null 2>&1
   apt-get install -y curl >/dev/null 2>&1
 
-  # All foreign servers in the failover list share identical Reality keys
-  # (enforced by the "reuse keys" step during their setup), so we only need
-  # to auto-fetch the public info from the FIRST one in the list.
-  PRIMARY_IP="${SERVER_ARRAY[0]}"
-  echo "==> Fetching Reality credentials from ${PRIMARY_IP}:${KEYSHARE_PORT} ..."
+  echo "==> Fetching Reality credentials from ${SERVER_IP}:${KEYSHARE_PORT} ..."
   REMOTE_INFO="/tmp/reality-info-remote.txt"
   rm -f "$REMOTE_INFO"
 
-  if ! curl -fsS -m 15 "http://${PRIMARY_IP}:${KEYSHARE_PORT}/reality-info-public.txt" -o "$REMOTE_INFO"; then
+  if ! curl -fsS -m 15 "http://${SERVER_IP}:${KEYSHARE_PORT}/reality-info-public.txt" -o "$REMOTE_INFO"; then
     echo ""
-    echo "Could not fetch credentials from ${PRIMARY_IP}."
+    echo "Could not fetch credentials from ${SERVER_IP}."
     echo "This means the 10-minute key-sharing window on that server has already"
     echo "closed (or the foreign setup wasn't run there yet)."
     echo "Fix: on the foreign server, run this script again and choose option 6"
@@ -257,9 +265,9 @@ setup_iran() {
   PROXY_PASS=$(openssl rand -hex 8)
 
   INBOUNDS_JSON="[]"
-  for PORT in "${PORT_ARRAY[@]}"; do
+  for P in "${PORT_ARRAY[@]}"; do
     INBOUNDS_JSON=$(echo "$INBOUNDS_JSON" | jq \
-      --arg port "$PORT" \
+      --arg port "$P" \
       --arg user "$PROXY_USER" \
       --arg pass "$PROXY_PASS" \
       '. + [{
@@ -275,87 +283,54 @@ setup_iran() {
       }]')
   done
 
-  # build one reality outbound per foreign server (all sharing the same keys)
-  OUTBOUNDS_JSON="[]"
-  for idx in "${!SERVER_ARRAY[@]}"; do
-    SIP="${SERVER_ARRAY[$idx]}"
-    TAG="reality-out-$((idx+1))"
-    OUTBOUNDS_JSON=$(echo "$OUTBOUNDS_JSON" | jq \
-      --arg ip "$SIP" \
-      --argjson port "$REALITY_PORT" \
-      --arg uuid "$UUID" \
-      --arg sni "$MASQ_DOMAIN" \
-      --arg pubkey "$PUBLIC_KEY" \
-      --arg shortid "$SHORT_ID" \
-      --arg tag "$TAG" \
-      '. + [{
-        "protocol": "vless",
-        "tag": $tag,
-        "settings": {
-          "vnext": [
-            {
-              "address": $ip,
-              "port": $port,
-              "users": [
-                { "id": $uuid, "flow": "xtls-rprx-vision", "encryption": "none" }
-              ]
-            }
-          ]
-        },
-        "streamSettings": {
-          "network": "tcp",
-          "security": "reality",
-          "realitySettings": {
-            "show": false,
-            "fingerprint": "chrome",
-            "serverName": $sni,
-            "publicKey": $pubkey,
-            "shortId": $shortid
-          },
-          "sockopt": { "tcpFastOpen": true }
-        }
-      }]')
-  done
-
   mkdir -p /usr/local/etc/xray
 
   jq -n \
     --argjson inbounds "$INBOUNDS_JSON" \
-    --argjson outbounds "$OUTBOUNDS_JSON" \
-    --argjson multi "$([ "${#SERVER_ARRAY[@]}" -gt 1 ] && echo true || echo false)" \
+    --arg server_ip "$SERVER_IP" \
+    --argjson reality_port "$REALITY_PORT" \
+    --arg uuid "$UUID" \
+    --arg sni "$MASQ_DOMAIN" \
+    --arg pubkey "$PUBLIC_KEY" \
+    --arg shortid "$SHORT_ID" \
     '{
       "log": { "loglevel": "warning" },
       "inbounds": $inbounds,
-      "outbounds": ($outbounds + [{ "protocol": "freedom", "tag": "direct" }])
-    }
-    + (if $multi then {
-        "observatory": {
-          "subjectSelector": ["reality-out"],
-          "probeUrl": "https://www.gstatic.com/generate_204",
-          "probeInterval": "10s",
-          "enableConcurrency": true
+      "outbounds": [
+        {
+          "protocol": "vless",
+          "tag": "reality-out",
+          "settings": {
+            "vnext": [
+              {
+                "address": $server_ip,
+                "port": $reality_port,
+                "users": [
+                  { "id": $uuid, "flow": "xtls-rprx-vision", "encryption": "none" }
+                ]
+              }
+            ]
+          },
+          "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+              "show": false,
+              "fingerprint": "chrome",
+              "serverName": $sni,
+              "publicKey": $pubkey,
+              "shortId": $shortid
+            },
+            "sockopt": { "tcpFastOpen": true }
+          }
         },
-        "routing": {
-          "domainStrategy": "AsIs",
-          "balancers": [
-            { "tag": "auto-failover", "selector": ["reality-out"], "strategy": { "type": "leastPing" } }
-          ],
-          "rules": [
-            { "type": "field", "network": "tcp,udp", "balancerTag": "auto-failover" }
-          ]
-        }
-      } else {
-        "routing": {
-          "domainStrategy": "AsIs",
-          "rules": [
-            { "type": "field", "network": "tcp,udp", "outboundTag": "reality-out-1" }
-          ]
-        }
-      } end)' > /usr/local/etc/xray/config.json
+        { "protocol": "freedom", "tag": "direct" }
+      ]
+    }' > /usr/local/etc/xray/config.json
 
   echo "==> Opening firewall ports ..."
-  for PORT in "${PORT_ARRAY[@]}"; do
-    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
+  for P in "${PORT_ARRAY[@]}"; do
+    ufw allow "${P}/tcp" >/dev/null 2>&1 || true
   done
   ufw allow OpenSSH >/dev/null 2>&1 || true
   ufw --force enable >/dev/null 2>&1 || true
@@ -364,13 +339,17 @@ setup_iran() {
   systemctl enable xray >/dev/null 2>&1
   systemctl restart xray
   sleep 1
-  systemctl --no-pager status xray | head -n 5
+  if ! systemctl is-active --quiet xray; then
+    echo "ERROR: xray failed to start. Log output:"
+    journalctl -u xray -n 30 --no-pager
+    exit 1
+  fi
 
-  IRAN_IP=$(curl -4 -s ifconfig.me || curl -4 -s icanhazip.com)
+  IRAN_IP=$(detect_public_ip) || IRAN_IP="unknown"
 
   cat > /root/proxy-info.txt <<EOF
 IRAN_IP=${IRAN_IP}
-FOREIGN_IPS=${SERVERS_RAW}
+FOREIGN_IP=${SERVER_IP}
 PORTS=${PORTS_RAW}
 USER=${PROXY_USER}
 PASS=${PROXY_PASS}
@@ -378,14 +357,7 @@ EOF
 
   echo ""
   echo "=================================================================="
-  echo " Iran server setup complete."
-  if [ "${#SERVER_ARRAY[@]}" -gt 1 ]; then
-    echo " Auto-failover enabled across ${#SERVER_ARRAY[@]} foreign servers: ${SERVERS_RAW}"
-    echo " Xray will automatically route through whichever one has the lowest ping"
-    echo " and is currently reachable (checked every 10s)."
-  else
-    echo " Tunnel to ${SERVERS_RAW} is up."
-  fi
+  echo " Iran server setup complete. Tunnel to ${SERVER_IP} is up."
   echo "------------------------------------------------------------------"
   echo " SOCKS5 ports open on ${IRAN_IP}: ${PORTS_RAW}"
   echo " Username : ${PROXY_USER}"
@@ -401,6 +373,7 @@ check_status() {
   if [ -f /root/reality-info.txt ]; then
     echo "==> Detected role: FOREIGN SERVER"
     echo "------------------------------------------------------------------"
+    # shellcheck disable=SC1090
     source /root/reality-info.txt
     if systemctl is-active --quiet xray; then
       echo " Xray service : RUNNING"
@@ -419,6 +392,7 @@ check_status() {
   elif [ -f /root/proxy-info.txt ]; then
     echo "==> Detected role: IRAN SERVER"
     echo "------------------------------------------------------------------"
+    # shellcheck disable=SC1090
     source /root/proxy-info.txt
     if systemctl is-active --quiet xray; then
       echo " Xray service : RUNNING"
@@ -439,10 +413,10 @@ check_status() {
     if [ "$CODE" == "200" ]; then
       echo " Tunnel test  : SUCCESS"
       echo " Exit IP seen : ${EXIT_IP}"
-      if echo "${FOREIGN_IPS:-}" | tr ',' '\n' | grep -qx "${EXIT_IP}"; then
-        echo " Exit IP matches one of the configured foreign servers -> tunnel confirmed working correctly."
+      if [ "${EXIT_IP}" == "${FOREIGN_IP:-}" ]; then
+        echo " Exit IP matches the foreign server -> tunnel confirmed working correctly."
       else
-        echo " NOTE: exit IP is not in the configured list (${FOREIGN_IPS:-unknown}) - check config."
+        echo " NOTE: exit IP differs from stored FOREIGN_IP (${FOREIGN_IP:-unknown}) - check config."
       fi
       echo " Round-trip time : ${TIME}s"
     else
@@ -469,12 +443,15 @@ uninstall_tunnel() {
   systemctl disable xray >/dev/null 2>&1 || true
 
   if [ -f /root/reality-info.txt ]; then
+    # shellcheck disable=SC1090
     source /root/reality-info.txt
     ufw delete allow ${PORT}/tcp >/dev/null 2>&1 || true
+    ufw delete allow ${KEYSHARE_PORT}/tcp >/dev/null 2>&1 || true
     rm -f /root/reality-info.txt
   fi
 
   if [ -f /root/proxy-info.txt ]; then
+    # shellcheck disable=SC1090
     source /root/proxy-info.txt
     IFS=',' read -ra P <<< "$PORTS"
     for p in "${P[@]}"; do
@@ -484,7 +461,7 @@ uninstall_tunnel() {
   fi
 
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove >/dev/null 2>&1 || true
-  rm -rf /usr/local/etc/xray
+  rm -rf /usr/local/etc/xray /tmp/reality-share
   rm -f /etc/sysctl.d/99-tunnel-tuning.conf
 
   echo "Uninstall complete. All tunnel components have been removed."
@@ -492,8 +469,7 @@ uninstall_tunnel() {
 
 # ------------------------------------------------------------
 # RE-SHARE KEYS (foreign server only - reopens the 10-min window
-# without regenerating keys, useful if it expired before the Iran
-# side could fetch it)
+# without regenerating keys)
 # ------------------------------------------------------------
 reshare_keys() {
   if [ ! -f /root/reality-info.txt ]; then
