@@ -430,7 +430,7 @@ action_status() {
         return
     fi
     local found=0
-    for svc in /etc/systemd/system/gost_*.service /etc/systemd/system/gostc_*.service; do
+    for svc in /etc/systemd/system/gost_*.service /etc/systemd/system/gostc_*.service /etc/systemd/system/gostr_*.service; do
         [ -e "$svc" ] || continue
         found=1
         local active dest proto ports mode
@@ -465,6 +465,7 @@ action_change_version() {
     install_gost "$v"
     systemctl restart gost_*.service 2>/dev/null
     systemctl restart gostc_*.service 2>/dev/null
+    systemctl restart gostr_*.service 2>/dev/null
 }
 
 action_auto_restart() {
@@ -479,6 +480,7 @@ action_auto_restart() {
 systemctl daemon-reload
 systemctl restart gost_*.service 2>/dev/null
 systemctl restart gostc_*.service 2>/dev/null
+systemctl restart gostr_*.service 2>/dev/null
 EOF
         chmod +x /usr/bin/gost_auto_restart.sh
         (crontab -l 2>/dev/null | grep -v gost_auto_restart.sh; echo "0 */$hours * * * /usr/bin/gost_auto_restart.sh") | crontab -
@@ -515,6 +517,41 @@ action_install_bbr() {
     fi
 }
 
+# ---------- ws / wss / mwss server side (run this ON Kharej) ----------
+# This is the "-L=relay+<transport>://:port" listener that a client-mode
+# tunnel (built with build_relay_client_tunnel_service above, on the Iran
+# side) dials into via -F. No embedded destination needed here - the real
+# destination is carried per-connection by the relay protocol itself, based
+# on what the client's own -L declared.
+action_setup_relay_listener() {
+    echo -e "${C_GREEN}This sets up the Kharej-side relay listener that an${C_RESET}"
+    echo -e "${C_GREEN}Iran-side ws/wss/mwss client tunnel connects to.${C_RESET}"
+    echo -e "${C_CYAN}1. ${C_RESET}ws"
+    echo -e "${C_CYAN}2. ${C_RESET}wss"
+    echo -e "${C_CYAN}3. ${C_RESET}mwss"
+    local opt protocol relay_port
+    opt=$(read_choice $'\e[97mYour choice: \e[0m' 1 3)
+    case "$opt" in
+        1) protocol="ws" ;;
+        2) protocol="wss" ;;
+        3) protocol="mwss" ;;
+    esac
+    relay_port=$(read_port $'\e[97mPort to listen on for incoming relay connections: \e[0m')
+
+    ensure_gost_installed || return
+
+    local gost_scheme="relay+${protocol}"
+    local unit_name="gostr_${relay_port}"
+    write_gost_unit "$unit_name" "ExecStart=/usr/local/bin/gost -L=${gost_scheme}://:${relay_port}"
+    systemctl enable "${unit_name}.service" > /dev/null 2>&1
+    systemctl daemon-reload
+    systemctl restart "${unit_name}.service"
+    apply_kernel_tuning
+
+    echo -e "${C_GREEN}Relay listener active on port ${relay_port} (${protocol}).${C_RESET}"
+    echo -e "${C_WHITE}On the Iran side, use Kharej IP = this server's IP and relay port = ${relay_port}.${C_RESET}"
+}
+
 action_uninstall() {
     read -rp $'\e[91mWarning\e[33m: this removes Gost and all tunnel data. Continue? (y/n): \e[0m' ans
     [ "$ans" != "y" ] && { echo "Canceled."; return; }
@@ -522,10 +559,13 @@ action_uninstall() {
     (crontab -l 2>/dev/null | grep -v gost_auto_restart.sh | grep -v drop_caches) | crontab - 2>/dev/null
     systemctl stop gost_*.service 2>/dev/null
     systemctl stop gostc_*.service 2>/dev/null
+    systemctl stop gostr_*.service 2>/dev/null
     systemctl disable gost_*.service 2>/dev/null
     systemctl disable gostc_*.service 2>/dev/null
+    systemctl disable gostr_*.service 2>/dev/null
     rm -f /etc/systemd/system/gost_*.service
     rm -f /etc/systemd/system/gostc_*.service
+    rm -f /etc/systemd/system/gostr_*.service
     rm -f /root/gost-kharej-companion-*.service
     rm -f /usr/local/bin/gost
     rm -rf "$GOST_DIR"
@@ -544,10 +584,11 @@ main_menu() {
     echo -e "${C_CYAN}6. ${C_RESET}Auto Restart Gost"
     echo -e "${C_CYAN}7. ${C_RESET}Auto Clear Cache"
     echo -e "${C_CYAN}8. ${C_RESET}Apply Speed/Stability Tuning (BBR + TCP tuning)"
-    echo -e "${C_CYAN}9. ${C_RESET}Uninstall"
-    echo -e "${C_CYAN}10. ${C_RESET}Exit"
+    echo -e "${C_CYAN}9. ${C_RESET}Setup Relay Listener (run this ON Kharej, for ws/wss/mwss)"
+    echo -e "${C_CYAN}10. ${C_RESET}Uninstall"
+    echo -e "${C_CYAN}11. ${C_RESET}Exit"
 
-    local choice; choice=$(read_choice $'\e[97mYour choice: \e[0m' 1 10)
+    local choice; choice=$(read_choice $'\e[97mYour choice: \e[0m' 1 11)
     case "$choice" in
         1) action_create_tunnel 4 ;;
         2) action_create_tunnel 6 ;;
@@ -557,8 +598,9 @@ main_menu() {
         6) action_auto_restart ;;
         7) action_auto_clear_cache ;;
         8) action_install_bbr ;;
-        9) action_uninstall ;;
-        10) echo -e "${C_GREEN}Bye.${C_RESET}"; exit 0 ;;
+        9) action_setup_relay_listener ;;
+        10) action_uninstall ;;
+        11) echo -e "${C_GREEN}Bye.${C_RESET}"; exit 0 ;;
     esac
 }
 
