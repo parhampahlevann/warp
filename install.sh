@@ -335,7 +335,7 @@ write_config() {
   "peer": "${CFG_PEER}",
   "transport": "${CFG_TRANSPORT:-udp}",
   "obfs": "${CFG_OBFS:-none}",
-  "sni": "${CFG_SNI:-www.cloudflare.com}",
+  "sni": "${CFG_SNI:-www.play.google.com}",
   "tun_name": "${CFG_TUN}",
   "local_ip": "${CFG_LOCAL_IP}",
   "peer_ip": "${CFG_PEER_IP}",
@@ -716,7 +716,7 @@ interactive_setup() {
   printf '\n%sCarrier transport%s — udp is strongly preferred.\n' "$BOLD" "$N"
   printf '  %sudp%s: a lost packet affects only the connection it carried\n' "$C" "$N"
   printf '  %stcp%s: survives UDP-blocking networks, but one loss stalls every connection\n' "$C" "$N"
-  CFG_TRANSPORT="$(ask "Transport (udp/tcp)" "udp")"
+  CFG_TRANSPORT="$(ask "Transport (udp/tcp)" "tcp")"
   [[ "$CFG_TRANSPORT" == "udp" || "$CFG_TRANSPORT" == "tcp" ]] || {
     warn "Unknown transport '$CFG_TRANSPORT' — using udp."; CFG_TRANSPORT="udp"; }
 
@@ -732,7 +732,7 @@ interactive_setup() {
   [[ "$CFG_OBFS" == "none" || "$CFG_OBFS" == "quic" ]] || {
     warn "Unknown obfs '$CFG_OBFS' — using none."; CFG_OBFS="none"; }
   if [[ "$CFG_OBFS" == "quic" ]]; then
-    CFG_SNI="$(ask "Server name to present in the handshake" "www.cloudflare.com")"
+    CFG_SNI="$(ask "Server name to present in the handshake" "www.play.google.com")"
   fi
 
   # --- network endpoints ---
@@ -753,7 +753,7 @@ interactive_setup() {
 
   # --- tunnel tunables ---
   printf '\n'
-  CFG_MTU="$(ask_int "MTU" "1300")"
+  CFG_MTU="$(ask_int "MTU" "1280")"
   CFG_TXQ="$(ask_int "Interface tx queue length" "1000")"
   CFG_PAD="$(ask_int "Max random padding per packet (0=off, anti-DPI)" "64")"
   CFG_REKEY="$(ask_int "Key rotation interval seconds (0=static)" "3600")"
