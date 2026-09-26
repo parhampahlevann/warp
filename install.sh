@@ -34,6 +34,27 @@ FWD_SERVICE="/etc/systemd/system/aestun-fwd.service"
 # next to this script — see fetch_core() / ensure_binary().
 CORE_REPO_ZIP="https://github.com/3aeidkhalili/AES-256-GCM-anti-DPI/archive/refs/heads/main.zip"
 
+# ---------------------------------------------------------------- defaults (PSK & port)
+# The wizard used to ask three separate questions just to agree on a key and a port
+# between the two servers. These two defaults remove that back-and-forth: unless you
+# override them, setup no longer asks for the shared key or the tunnel port at all.
+# Override per-run without editing the file:
+#   AESTUN_PSK="$(head -c32 /dev/urandom | base64)" AESTUN_PORT=51820 sudo -E ./aestun.sh install
+# (sudo drops the environment unless you pass -E — or run as root directly.)
+#
+# SECURITY NOTE about DEFAULT_PSK_PLACEHOLDER: it is baked into every copy of this file.
+# If you never change it and never set AESTUN_PSK, every install anyone ever makes from
+# an unmodified copy of aestun.sh shares this exact key — and anyone who has a copy of
+# this script (which, for an anti-DPI tunnel, includes the censor you're trying to get
+# past) already knows it too. That defeats the point of a shared secret. Fine for a
+# quick first test; before relying on the tunnel, do ONE of:
+#   - edit the string below, once, to your own `head -c32 /dev/urandom | base64`, or
+#   - export AESTUN_PSK (see above) every time you run this script.
+# Either way, both servers must end up with the SAME value.
+DEFAULT_PSK_PLACEHOLDER="htGTLsF6vxtBF7LWPMz5/+80zIeuX22wwKCbtpGQsj4="
+DEFAULT_PSK="${AESTUN_PSK:-$DEFAULT_PSK_PLACEHOLDER}"
+DEFAULT_PORT="${AESTUN_PORT:-51820}"
+
 # ------------------------------------------------------------------------- colors
 if [[ -t 1 ]]; then
   R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; C=$'\e[36m'; W=$'\e[97m'; D=$'\e[2m'; BOLD=$'\e[1m'; N=$'\e[0m'
@@ -86,13 +107,54 @@ ask_yn() {
   local p="$1" d="${2:-N}" a hint
   [[ "$d" == Y ]] && hint="Y/n" || hint="y/N"
   printf '%s%s%s [%s]: ' "$W" "$p" "$N" "$hint" >&2
-  if ! read -r a; then a="$d"; [[ "$a" =~ ^[yY]$ ]]; return $(( $? == 0 ? 1 : $? )); fi
+  # EOF (no TTY / closed stdin) always returns non-zero here, regardless of what the
+  # default was — so a caller doing `if ask_yn ... "Y"; then` never mistakes a closed
+  # stdin for an explicit yes.
+  if ! read -r a; then return 1; fi
   a="${a:-$d}"
   [[ "$a" =~ ^[yY]$ ]]
 }
 
+# ask_choice "prompt" "default_value" opt1 opt2 ... -> prints the options as a numbered,
+# one-per-line menu (marking the default), then reads either a number OR the raw option
+# text. Enter (empty input) always selects the default — no need to type an exact string
+# like "aes-gcm" or "udp" correctly. Echoes the chosen option value.
+ask_choice() {
+  local prompt="$1" d="$2"; shift 2
+  local -a opts=("$@")
+  printf '%s%s%s\n' "$W" "$prompt" "$N" >&2
+  local i=1 o
+  for o in "${opts[@]}"; do
+    if [[ "$o" == "$d" ]]; then
+      printf '  %s%d%s) %-20s %s(Enter = this)%s\n' "$C" "$i" "$N" "$o" "$D" "$N" >&2
+    else
+      printf '  %s%d%s) %s\n' "$C" "$i" "$N" "$o" >&2
+    fi
+    i=$(( i + 1 ))
+  done
+  local a
+  printf '%sChoose%s: ' "$W" "$N" >&2
+  if ! read -r a; then printf '%s' "$d"; return 1; fi
+  if [[ -z "$a" ]]; then printf '%s' "$d"; return 0; fi
+  if [[ "$a" =~ ^[0-9]+$ ]] && (( a >= 1 && a <= ${#opts[@]} )); then
+    printf '%s' "${opts[$((a-1))]}"; return 0
+  fi
+  for o in "${opts[@]}"; do
+    [[ "$o" == "$a" ]] && { printf '%s' "$o"; return 0; }
+  done
+  printf '%s\n' "${Y}  (not a valid choice — using the default)${N}" >&2
+  printf '%s' "$d"
+  return 0
+}
+
 is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+# looks_like_bare_port STR -> true if STR is just digits (no dots/letters) — i.e. it's
+# almost certainly a port number typed where a host/IP was expected. This is exactly how
+# "peer": "51820:51820" happens: the wizard asks for the OTHER server's host, and if a
+# port number is typed there by mistake, CFG_PEER ends up "<port>:<port>" and the daemon
+# spends forever trying (and failing) to resolve a hostname that is really just a number.
+looks_like_bare_port() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
 # ask_int "prompt" "default" -> a non-negative integer; falls back to default on non-numeric input.
 ask_int() {
@@ -296,12 +358,24 @@ write_service() {
 Description=aestun - AES-256-GCM obfuscated server-to-server tunnel
 After=network-online.target
 Wants=network-online.target
+# BUG FIX: systemd's default start-rate limit (5 restarts / 10s) means Restart=always
+# quietly stops meaning "always" the moment the daemon crash-loops even briefly (a bad
+# rekey, an OOM blip, a transient DNS failure resolving the peer host) — the unit lands
+# in "failed" and stays down until someone runs systemctl reset-failed / restarts it by
+# hand. From the outside that is indistinguishable from "the tunnel disconnected and
+# never came back on its own", which is exactly the symptom to avoid. Disabling the
+# limit here means it keeps retrying forever, which is what a tunnel daemon with
+# Restart=always should actually do.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${BIN_DST} -config ${CONF}
-ExecStartPost=${MGR_DST} fwd-rule add
-ExecStopPost=${MGR_DST} fwd-rule del
+# "-" prefix: a hiccup in the (optional) port-forwarding hook must never take the whole
+# tunnel down. Without it, ExecStartPost failing (e.g. peer_ip briefly blank during an
+# edit) marks this entire unit failed even though the tunnel binary itself started fine.
+ExecStartPost=-${MGR_DST} fwd-rule add
+ExecStopPost=-${MGR_DST} fwd-rule del
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -385,6 +459,28 @@ close_firewall() { # close_firewall PORT [PROTO]
   command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
 }
 
+# port_is_bound PORT [PROTO] -> 0 if something is actually listening locally on it.
+# Used by diagnostics: a port can be "open" in the firewall yet nothing is bound to it
+# (service crashed/not started), or bound yet the firewall still blocks it — these are
+# two different failures with two different fixes, so they're checked separately.
+port_is_bound() {
+  local port="$1" proto="${2:-udp}"
+  command -v ss >/dev/null 2>&1 || return 1
+  if [[ "$proto" == "udp" ]]; then
+    ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
+  else
+    ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
+  fi
+}
+
+# fw_rule_present PORT [PROTO] -> 0 if the local iptables INPUT ACCEPT rule this script
+# adds (open_firewall) is actually present.
+fw_rule_present() {
+  local port="$1" proto="${2:-udp}"
+  command -v iptables >/dev/null 2>&1 || return 1
+  iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null
+}
+
 # =============================================================================
 #  Network optimization (Ubuntu sysctl tuning for the tunnel)
 # =============================================================================
@@ -456,6 +552,33 @@ remove_network_opt() {
   msg "Network optimization removed and runtime values reset to defaults (cubic/pfifo_fast)."
 }
 
+# ensure_sock_buf_ceiling BYTES — raise net.core.rmem_max/wmem_max to at least BYTES if
+# they're currently lower, and persist that via its own tiny sysctl drop-in.
+#
+# BUG FIX: config.json's rcvbuf/sndbuf (CFG_BUF, e.g. 8 MB) request a socket buffer from
+# the kernel, but the kernel silently CLAMPS that request to net.core.rmem_max/wmem_max —
+# it does not error. Stock Ubuntu ships those at ~208 KB. Previously the only place that
+# raised them was the OPTIONAL "Apply Ubuntu network optimization" step; skip that step
+# (or answer "N") and the configured buffer was quietly cut to ~1/40th of what was asked
+# for, which shows up as avoidable packet loss / stalling under any real load — with
+# nothing in the UI hinting that's why. This keeps just that one ceiling in sync
+# unconditionally, independent of whether the rest of apply_network_opt() is ever used.
+ensure_sock_buf_ceiling() {
+  local want="${1:-8388608}" cur
+  cur="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
+  (( cur < want )) && { sysctl -w net.core.rmem_max="$want" >/dev/null 2>&1 || true; }
+  cur="$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)"
+  (( cur < want )) && { sysctl -w net.core.wmem_max="$want" >/dev/null 2>&1 || true; }
+  mkdir -p /etc/sysctl.d
+  cat > /etc/sysctl.d/98-aestun-bufmin.conf <<EOF
+# Managed by aestun — minimum socket buffer ceiling so the tunnel's configured
+# rcvbuf/sndbuf (config.json) is never silently clamped by the kernel default,
+# independent of whether the optional full network optimization is applied.
+net.core.rmem_max = ${want}
+net.core.wmem_max = ${want}
+EOF
+}
+
 show_network_opt() {
   hdr "Current network settings"
   local keys=(net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max net.core.wmem_max \
@@ -494,6 +617,31 @@ except Exception:
 PY
 }
 
+# fwd_flush_all — remove every forwarding rule this script has ever added, regardless of
+# what is currently in config.json.
+#
+# BUG FIX: fwd_apply() used to clean up by re-reading the CURRENT forward list from
+# config.json and deleting only those rules. That is wrong the moment a forward is
+# REMOVED: fwd_remove() edits config.json first, so by the time the cleanup step ran,
+# the removed entry was already gone from the file and its DNAT/MASQUERADE rule was
+# never targeted for deletion — the port kept being silently forwarded forever, even
+# after "remove a forward" reported success. Tagging every rule this script installs
+# with a fixed comment, and flushing by that tag instead of by recomputing from config,
+# makes cleanup correct no matter what changed in between.
+fwd_flush_all() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  local chain rest
+  for chain in PREROUTING POSTROUTING; do
+    while IFS= read -r rest; do
+      [[ -n "$rest" ]] || continue
+      # shellcheck disable=SC2086
+      iptables -t nat -D "$chain" $rest 2>/dev/null || true
+    done < <(iptables -t nat -S "$chain" 2>/dev/null \
+               | sed -n "s/^-A ${chain} //p" \
+               | grep -F -- '--comment aestun-fwd')
+  done
+}
+
 fwd_apply() { # (re)install DNAT+MASQUERADE rules for every configured forward
   [[ -f "$CONF" ]] || return 0
   ensure_deps
@@ -501,40 +649,41 @@ fwd_apply() { # (re)install DNAT+MASQUERADE rules for every configured forward
   local tun; tun="$(json_get "$CONF" tun_name)"; tun="${tun:-tun0}"
   [[ -n "$peer_ip" ]] || { warn "fwd_apply: peer_ip missing from config, skipping."; return 1; }
 
-  fwd_rule del >/dev/null 2>&1 || true   # clean slate before re-adding, avoids duplicate rules
+  local rows; rows="$(fwd_list_from_conf)"
+  fwd_flush_all   # clean slate before re-adding, tag-based so nothing is ever left stale
 
-  local line port tport proto n=0
+  # BUG FIX: a forward added later from the menu (option 13 -> 1) did not guarantee
+  # ip_forward was on — only the very first interactive_setup() run did that. If it had
+  # never been enabled, DNAT'd packets were dropped by the kernel before POSTROUTING,
+  # which looks exactly like "the forward doesn't work" / packet loss. Ensure it here,
+  # every time there is at least one forward, not just once at initial setup.
+  [[ -n "$rows" ]] && { sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true; }
+
+  local port tport proto n=0
   while read -r port tport proto; do
     [[ -z "$port" ]] && continue
     proto="${proto:-tcp}"
     iptables -t nat -A PREROUTING -p "$proto" --dport "$port" \
+      -m comment --comment aestun-fwd \
       -j DNAT --to-destination "${peer_ip}:${tport}"
     iptables -t nat -A POSTROUTING -o "$tun" -p "$proto" --dport "$tport" -d "$peer_ip" \
+      -m comment --comment aestun-fwd \
       -j MASQUERADE
     open_firewall "$port" "$proto"
     n=$(( n + 1 ))
-  done < <(fwd_list_from_conf)
-  (( n > 0 )) && msg "Applied ${n} port-forward rule(s) over ${tun} -> ${peer_ip}."
+  done <<< "$rows"
+  if (( n > 0 )); then
+    msg "Applied ${n} port-forward rule(s) over ${tun} -> ${peer_ip}."
+    warn "Remember: forwarded ports also need to be open in your cloud provider's OWN"
+    warn "firewall/security group (this script only manages the OS firewall)."
+  fi
   return 0
 }
 
 fwd_rule() { # invoked by systemd (ExecStartPost/ExecStopPost) and by fwd_apply above
   case "${1:-}" in
     add) fwd_apply ;;
-    del)
-      [[ -f "$CONF" ]] || return 0
-      local peer_ip tun port tport proto
-      peer_ip="$(json_get "$CONF" peer_ip)"
-      tun="$(json_get "$CONF" tun_name)"; tun="${tun:-tun0}"
-      while read -r port tport proto; do
-        [[ -z "$port" ]] && continue
-        proto="${proto:-tcp}"
-        iptables -t nat -D PREROUTING -p "$proto" --dport "$port" \
-          -j DNAT --to-destination "${peer_ip}:${tport}" 2>/dev/null || true
-        iptables -t nat -D POSTROUTING -o "$tun" -p "$proto" --dport "$tport" -d "$peer_ip" \
-          -j MASQUERADE 2>/dev/null || true
-      done < <(fwd_list_from_conf)
-      return 0 ;;
+    del) fwd_flush_all; return 0 ;;
     *) echo "usage: $0 fwd-rule {add|del}" >&2; return 1 ;;
   esac
 }
@@ -566,27 +715,57 @@ PY
   chmod 600 "$CONF"
 }
 
+# fwd_prompt_ports_csv — ask for a comma-separated list of ports ONCE (e.g. "1080,443,8080")
+# instead of looping "add one port? y/n" for every single port. Prints "port target_port
+# proto" lines to stdout, one per valid entry (invalid ones are warned about on stderr and
+# skipped, everything else still goes through). Shared by the setup wizard and the menu.
+fwd_prompt_ports_csv() {
+  local src tgt proto
+  src="$(ask_req "Public port(s) on THIS server — comma separated, e.g. 1080,443")" || return 1
+  tgt="$(ask "Target port(s) on the FOREIGN server — comma separated, same order (Enter = same as above)" "")"
+  proto="$(ask "Protocol for all of the above (tcp/udp/both)" "tcp")"
+  case "$proto" in tcp|udp|both) ;; *) warn "  unknown protocol '$proto' — using tcp."; proto="tcp" ;; esac
+
+  local -a sp tp
+  IFS=',' read -ra sp <<< "$(printf '%s' "$src" | tr -d ' ')"
+  if [[ -n "$tgt" ]]; then
+    IFS=',' read -ra tp <<< "$(printf '%s' "$tgt" | tr -d ' ')"
+    if (( ${#tp[@]} != ${#sp[@]} )); then
+      warn "  target port count (${#tp[@]}) doesn't match source count (${#sp[@]}) — using the same ports as targets."
+      tp=("${sp[@]}")
+    fi
+  else
+    tp=("${sp[@]}")
+  fi
+
+  local i port tport
+  for (( i = 0; i < ${#sp[@]}; i++ )); do
+    port="${sp[$i]}"; tport="${tp[$i]:-$port}"
+    if ! is_port "$port"; then warn "  skipping invalid public port: ${port:-<empty>}"; continue; fi
+    if ! is_port "$tport"; then warn "  skipping invalid target port: ${tport:-<empty>} (for ${port})"; continue; fi
+    if [[ "$proto" == "both" ]]; then
+      printf '%s %s tcp\n' "$port" "$tport"
+      printf '%s %s udp\n' "$port" "$tport"
+    else
+      printf '%s %s %s\n' "$port" "$tport" "$proto"
+    fi
+  done
+}
+
 # fwd_wizard_prompt — used both during interactive_setup (before the config file exists,
 # so it fills CFG_FWD_JSON) and standalone from the menu (writes straight to config.json).
 fwd_wizard_collect() { # sets CFG_FWD_JSON
   local items=() port tport proto
   printf '\n%sPort forwarding%s — expose ports on THIS (Iran) server that get transparently\n' "$BOLD" "$N"
-  printf 'forwarded through the tunnel to the foreign server. Add as many as you want.\n'
+  printf 'forwarded through the tunnel to the foreign server. Enter several at once, comma\n'
+  printf 'separated (e.g. 1080,443) — no need to add them one by one.\n'
   printf '%sOnly meaningful on the Iran/role-a side; skip this on the foreign server.%s\n' "$D" "$N"
-  while ask_yn "Add a port to forward" "N"; do
-    port="$(ask_int "  Public port on THIS server" "443")"
-    is_port "$port" || { warn "  invalid port, skipping."; continue; }
-    tport="$(ask_int "  Target port on the FOREIGN server" "$port")"
-    is_port "$tport" || { warn "  invalid port, skipping."; continue; }
-    proto="$(ask "  Protocol (tcp/udp/both)" "tcp")"
-    case "$proto" in
-      tcp|udp) items+=("{\"port\":${port},\"target_port\":${tport},\"proto\":\"${proto}\"}") ;;
-      both)    items+=("{\"port\":${port},\"target_port\":${tport},\"proto\":\"tcp\"}")
-               items+=("{\"port\":${port},\"target_port\":${tport},\"proto\":\"udp\"}") ;;
-      *) warn "  unknown protocol '$proto', defaulting to tcp."
-         items+=("{\"port\":${port},\"target_port\":${tport},\"proto\":\"tcp\"}") ;;
-    esac
-    msg "  queued: ${port}/${proto} -> foreign:${tport}"
+  while ask_yn "Add port(s) to forward" "N"; do
+    while read -r port tport proto; do
+      [[ -z "$port" ]] && continue
+      items+=("{\"port\":${port},\"target_port\":${tport},\"proto\":\"${proto}\"}")
+      msg "  queued: ${port}/${proto} -> foreign:${tport}"
+    done < <(fwd_prompt_ports_csv)
   done
   if (( ${#items[@]} == 0 )); then
     CFG_FWD_JSON="[]"
@@ -617,29 +796,31 @@ fwd_menu() {
   ${C}3${N}) re-apply rules now
   ${C}0${N}) back
 EOF
-    local c; c="$(ask 'Choose' '')" || return
+    local c; c="$(ask 'Choose' '0')" || return
     case "$c" in
       1)
-        local port tport proto
-        port="$(ask_int "Public port on THIS server" "443")"
-        tport="$(ask_int "Target port on the FOREIGN server" "$port")"
-        proto="$(ask "Protocol (tcp/udp)" "tcp")"
-        [[ "$proto" == "tcp" || "$proto" == "udp" ]] || proto="tcp"
-        if is_port "$port" && is_port "$tport"; then
+        local port tport proto n=0
+        while read -r port tport proto; do
+          [[ -z "$port" ]] && continue
           fwd_add "$port" "$tport" "$proto"
-          fwd_apply
-          msg "Forward added and applied."
-        else
-          err "invalid port(s)."
-        fi
+          n=$(( n + 1 ))
+        done < <(fwd_prompt_ports_csv)
+        if (( n > 0 )); then fwd_apply; msg "${n} forward(s) added and applied."
+        else err "no valid ports entered."; fi
         pause ;;
       2)
-        local port proto
-        port="$(ask_int "Public port to remove" "0")"
+        local ports_csv proto port
+        ports_csv="$(ask "Public port(s) to remove — comma separated" "0")"
         proto="$(ask "Protocol (tcp/udp)" "tcp")"
-        fwd_remove "$port" "$proto"
+        [[ "$proto" == "tcp" || "$proto" == "udp" ]] || proto="tcp"
+        local -a rm_ports; IFS=',' read -ra rm_ports <<< "$(printf '%s' "$ports_csv" | tr -d ' ')"
+        for port in "${rm_ports[@]}"; do
+          is_port "$port" || continue
+          fwd_remove "$port" "$proto"
+          close_firewall "$port" "$proto"   # BUG FIX: the port used to stay open after removal
+        done
         fwd_apply
-        msg "Forward removed."
+        msg "Forward(s) removed."
         pause ;;
       3) fwd_apply; pause ;;
       0) return ;;
@@ -653,6 +834,13 @@ EOF
 # =============================================================================
 interactive_setup() {
   hdr "aestun tunnel setup"
+  # BUG FIX: this used to only happen in do_install()/main_menu(), AFTER this function
+  # returned — but this function itself starts the service (systemctl enable --now
+  # aestun) before returning. On a brand-new install that meant ExecStartPost/ExecStopPost
+  # pointed at a manager binary that was not copied into place yet, so the unit's very
+  # first start could be reported as failed and (Restart=always) flap until the later
+  # install line finally ran. Do it first, unconditionally, so it's always in place.
+  install -m 0755 "$SELF" "$MGR_DST" 2>/dev/null || true
   ensure_deps
   ensure_binary || { pause; return 1; }
 
@@ -668,17 +856,26 @@ interactive_setup() {
     CFG_ROLE="a"; def_local="10.8.0.1/24"; def_peer="10.8.0.2"
   fi
 
-  # --- key ---
+  # --- key (PSK) — not asked by default anymore; see DEFAULT_PSK near the top of the file ---
   local existing=""; [[ -f "$CONF" ]] && existing="$(json_get "$CONF" key)"
-  printf '\n%sShared key%s (base64 of 32 bytes) — must be IDENTICAL on both servers.\n' "$BOLD" "$N"
-  if [[ -n "$existing" ]] && ask_yn "Keep the existing key" "Y"; then
+  printf '\n%sShared key (PSK)%s — must be IDENTICAL on both servers.\n' "$BOLD" "$N"
+  if [[ -n "$existing" ]]; then
     CFG_KEY="$existing"
-  elif ask_yn "Generate a new random key" "Y"; then
-    CFG_KEY="$("$BIN_DST" keygen)"
-    printf '  %sGenerated key (use the SAME on the other server):%s\n  %s%s%s\n' "$Y" "$N" "$BOLD" "$CFG_KEY" "$N"
+    printf '  keeping the key already configured on this server (not asked).\n'
   else
-    CFG_KEY="$(ask_req "Paste the base64 key")" || return 1
+    CFG_KEY="$DEFAULT_PSK"
+    if [[ "$CFG_KEY" == "$DEFAULT_PSK_PLACEHOLDER" ]]; then
+      printf '  %susing this script'"'"'s built-in default PSK — not asked.%s\n' "$Y" "$N"
+      printf '  %sthat default is IDENTICAL on every unmodified copy of this script anywhere.%s\n' "$R" "$N"
+      printf '  fine to try the tunnel with, but before relying on it: edit\n'
+      printf '  DEFAULT_PSK_PLACEHOLDER near the top of this file (or export AESTUN_PSK\n'
+      printf '  before running) to a key only your two servers know, matching on both.\n'
+    else
+      printf '  using AESTUN_PSK from the environment — not asked.\n'
+    fi
   fi
+  printf '  %s(change it later: edit DEFAULT_PSK_PLACEHOLDER in this file, export AESTUN_PSK,\n' "$D"
+  printf '  or edit the "key" field directly via the menu'"'"'s "Edit config" option.)%s\n' "$N"
 
   # --- cipher suite ---
   # This matters far more than it looks. Go only has a fast AES-GCM when the CPU exposes
@@ -704,9 +901,7 @@ interactive_setup() {
   printf '  %schacha20-poly1305%s  : fast everywhere, no special instructions needed\n' "$C" "$N"
   printf '  %sThe wire format is byte-identical either way, so the choice is invisible to DPI.%s\n' "$D" "$N"
   printf '  %sIf the OTHER server lacks AES-NI, choose chacha20-poly1305 on BOTH.%s\n' "$D" "$N"
-  CFG_CIPHER="$(ask "Cipher (aes-gcm/chacha20-poly1305)" "$rec_cipher")"
-  [[ "$CFG_CIPHER" == "aes-gcm" || "$CFG_CIPHER" == "chacha20-poly1305" ]] || {
-    warn "Unknown cipher '$CFG_CIPHER' — using $rec_cipher."; CFG_CIPHER="$rec_cipher"; }
+  CFG_CIPHER="$(ask_choice "Cipher suite" "$rec_cipher" "aes-gcm" "chacha20-poly1305")"
 
   # --- carrier transport ---
   # UDP is the default for a reason: the carrier multiplexes every inner connection.
@@ -716,9 +911,13 @@ interactive_setup() {
   printf '\n%sCarrier transport%s — udp is strongly preferred.\n' "$BOLD" "$N"
   printf '  %sudp%s: a lost packet affects only the connection it carried\n' "$C" "$N"
   printf '  %stcp%s: survives UDP-blocking networks, but one loss stalls every connection\n' "$C" "$N"
-  CFG_TRANSPORT="$(ask "Transport (udp/tcp)" "tcp")"
-  [[ "$CFG_TRANSPORT" == "udp" || "$CFG_TRANSPORT" == "tcp" ]] || {
-    warn "Unknown transport '$CFG_TRANSPORT' — using udp."; CFG_TRANSPORT="udp"; }
+  # BUG FIX: the three lines above this recommend UDP explicitly, but the default answer
+  # passed to `ask` was "tcp" — so just pressing Enter silently picked the transport this
+  # menu tells you NOT to pick. Over a lossy path (very common in Iran) TCP-over-TCP
+  # head-of-line-blocking is a strong, concrete way a tunnel "stalls/drops after a while
+  # under load" without the service itself ever crashing. Default now matches the advice;
+  # run auto-test (menu option 12) to confirm which is actually best on your specific path.
+  CFG_TRANSPORT="$(ask_choice "Carrier transport" "udp" "udp" "tcp")"
 
   # --- wire obfuscation ---
   # The payload is already indistinguishable from random, which is the problem: nothing
@@ -728,21 +927,36 @@ interactive_setup() {
   printf '  %snone%s: raw high-entropy datagrams (compatible with older builds)\n' "$C" "$N"
   printf '  %squic%s: shapes the carrier as its natural TLS-family form — QUIC over UDP,\n' "$C" "$N"
   printf '        TLS (records + synthetic handshake) over TCP\n'
-  CFG_OBFS="$(ask "Obfuscation (none/quic)" "quic")"
-  [[ "$CFG_OBFS" == "none" || "$CFG_OBFS" == "quic" ]] || {
-    warn "Unknown obfs '$CFG_OBFS' — using none."; CFG_OBFS="none"; }
+  CFG_OBFS="$(ask_choice "Wire obfuscation" "quic" "quic" "none")"
   if [[ "$CFG_OBFS" == "quic" ]]; then
     CFG_SNI="$(ask "Server name to present in the handshake" "www.play.google.com")"
   fi
 
-  # --- network endpoints ---
+  # --- network endpoints — port is not asked anymore, see DEFAULT_PORT near the top ---
   printf '\n'
-  CFG_LISTEN_PORT="$(ask "${CFG_TRANSPORT^^} listen port on THIS server" "51820")"
-  is_port "$CFG_LISTEN_PORT" || { CFG_LISTEN_PORT=51820; warn "Invalid port, using 51820."; }
+  CFG_LISTEN_PORT="$DEFAULT_PORT"
+  is_port "$CFG_LISTEN_PORT" || CFG_LISTEN_PORT=51820
+  printf '%s listen port on THIS server: %s%s%s (not asked — set AESTUN_PORT to change it)\n' \
+    "${CFG_TRANSPORT^^}" "$C" "$CFG_LISTEN_PORT" "$N"
   local phost pport
   phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
-  pport="$(ask "${CFG_TRANSPORT^^} port of the OTHER server" "$CFG_LISTEN_PORT")"
-  is_port "$pport" || pport="$CFG_LISTEN_PORT"
+  # BUG FIX: this is the exact input that produced "peer": "51820:51820" in the field —
+  # a port number (or a "host:port" pair) typed here instead of a bare host/IP. Loop
+  # until the answer at least looks like an address, instead of writing garbage into
+  # config.json that the daemon will spend hours failing to resolve.
+  while looks_like_bare_port "$phost" || [[ "$phost" == *:* ]]; do
+    if [[ "$phost" == *:* ]]; then
+      err "  '$phost' includes a ':' — enter ONLY the OTHER server's IP or domain, with"
+      err "  no port; the port is added automatically."
+    else
+      err "  '$phost' looks like a port number, not an address — enter the OTHER server's"
+      err "  public IP or domain (e.g. 203.0.113.7 or vpn2.example.com), not a port."
+    fi
+    phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
+  done
+  pport="$CFG_LISTEN_PORT"
+  printf '%s port of the OTHER server: %s%s%s (assumed the same as above — not asked)\n' \
+    "${CFG_TRANSPORT^^}" "$C" "$pport" "$N"
   CFG_PEER="${phost}:${pport}"
 
   # --- tunnel interface / local IPs ---
@@ -775,7 +989,7 @@ interactive_setup() {
   # --- Anti-DPI hardening (optional; all OFF by default) ---
   # These layer on top of the tunnel. Enable only what your path needs — a wrong option is at
   # best wasted packets. Full explanation in README section 15. They can also be toggled later
-  # from the management menu (option x) without re-running this wizard.
+  # from the management menu (option 11) without re-running this wizard.
   CFG_DESYNC=false; CFG_DESYNC_BADSUM=false; CFG_JUNK=false; CFG_HOP=false; CFG_SPLIT=false
   CFG_HOP_PORTS="443, 8443, 2053, 2083, 2087, 2096"
   printf '\n%sAnti-DPI hardening%s — optional, all off by default (README §15).\n' "$BOLD" "$N"
@@ -802,6 +1016,7 @@ interactive_setup() {
   fi
 
   write_config
+  ensure_sock_buf_ceiling "${CFG_BUF:-8388608}"
   write_service
   systemctl daemon-reload
   systemctl enable --now aestun >/dev/null 2>&1 && msg "Service enabled and started."
@@ -821,8 +1036,7 @@ interactive_setup() {
   printf '\n'
   if ask_yn "Apply Ubuntu network optimization now (BBR, buffers, MTU probing, forwarding)" "Y"; then
     local cc buf fwd
-    cc="$(ask "Congestion control (bbr/cubic)" "bbr")"
-    [[ "$cc" == "bbr" || "$cc" == "cubic" ]] || { warn "Unknown congestion control '$cc' — using bbr."; cc="bbr"; }
+    cc="$(ask_choice "Congestion control" "bbr" "bbr" "cubic")"
     buf="$(ask_int "Max socket buffer size in bytes" "16777216")"
     if ask_yn "Enable IP forwarding" "Y"; then fwd=1; else fwd=0; fi
     apply_network_opt "$cc" "$buf" "$fwd"
@@ -833,6 +1047,17 @@ interactive_setup() {
   printf '%sNow run the SAME installer on the other server with:%s\n' "$D" "$N"
   printf '   - the %ssame key%s\n   - the opposite role (%s)\n   - peer = THIS server public IP\n' \
     "$BOLD" "$N" "$([[ $CFG_ROLE == a ]] && echo 'Foreign / b' || echo 'Iran / a')"
+
+  # Quick self-check right now instead of waiting for the user to discover a problem
+  # later. If the OTHER server isn't set up yet, the ping at the end is expected to
+  # fail — that's normal at this point, not a bug; everything ABOVE the ping (service,
+  # interface, port, firewall) is fully verifiable from this one side alone.
+  printf '\n'; hdr "Quick self-check on THIS side"
+  sleep 2
+  if ! diag_report; then
+    printf '\n%sIf the other server is already set up too, re-run option 4 from the main menu\n' "$D"
+    printf 'on BOTH sides for the full picture.%s\n' "$N"
+  fi
   return 0
 }
 # ------------------------------------------------------------------ service control
@@ -851,7 +1076,7 @@ service_menu() {
   ${C}6${N}) full status
   ${C}0${N}) back
 EOF
-    local __c; __c="$(ask 'Choose' '')" || { clear; exit 0; }
+    local __c; __c="$(ask 'Choose' '0')" || { clear; exit 0; }
     case "$__c" in
       1) svc start ;;
       2) svc stop ;;
@@ -946,17 +1171,102 @@ monitor() {
 }
 
 # ------------------------------------------------------------------- connectivity
-test_conn() {
-  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; pause; return; }
-  local peer_ip; peer_ip="$(json_get "$CONF" peer_ip)"
-  hdr "Connectivity test over the tunnel"
-  [[ -z "$peer_ip" ]] && { err "peer_ip not set in config."; pause; return; }
-  printf 'Pinging %s%s%s (peer tunnel IP)...\n\n' "$W" "$peer_ip" "$N"
-  if ping -c 4 -W 2 "$peer_ip"; then
-    printf '\n'; msg "Tunnel link is healthy."
+# diag_report — the real diagnostic behind menu option 4. Checks every link in the
+# chain in order (service, tun interface, peer address sanity, local port binding,
+# local firewall rule, then actual ping) instead of just reporting "ping failed", and
+# ends with a specific, ordered checklist when something's wrong. Returns 0 if healthy.
+diag_report() {
+  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; return 1; }
+  local transport port peer host peer_ip tun listen ok=1
+  transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
+  listen="$(json_get "$CONF" listen)"; port="${listen##*:}"
+  peer="$(json_get "$CONF" peer)"; host="${peer%:*}"
+  peer_ip="$(json_get "$CONF" peer_ip)"
+  tun="$(json_get "$CONF" tun_name)"; tun="${tun:-tun0}"
+
+  local svc_state; svc_state="$(svc_active aestun)"
+  if [[ "$svc_state" == "active" ]]; then
+    msg "service: active"
   else
-    printf '\n'; err "No reply. Check: both services active, UDP port open, key/roles correct."
+    err "service: ${svc_state} — nothing else here will work until it's active."
+    err "  check: journalctl -u aestun -n 50"
+    ok=0
   fi
+
+  if ip link show "$tun" >/dev/null 2>&1; then
+    if ip link show "$tun" 2>/dev/null | grep -q "state UP\|UNKNOWN"; then
+      msg "interface ${tun}: up"
+    else
+      err "interface ${tun}: exists but is DOWN"; ok=0
+    fi
+  else
+    err "interface ${tun}: does not exist yet (daemon hasn't brought the tunnel up)"; ok=0
+  fi
+
+  # The exact misconfiguration that causes silent, permanent RX=0: a bare port number
+  # (or a leftover "host:port" pair) saved as the peer's HOST instead of its address.
+  if [[ -n "$host" ]]; then
+    if looks_like_bare_port "$host"; then
+      err "config 'peer' host is '${host}' — that's a port number, not an address. Fix it"
+      err "  in option 7 (Edit config) or re-run setup (option 1)."
+      ok=0
+    elif command -v getent >/dev/null 2>&1 && ! getent hosts "$host" >/dev/null 2>&1 \
+         && [[ ! "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      warn "config 'peer' host '${host}' does not resolve right now."
+    fi
+  fi
+
+  if [[ -n "$port" ]]; then
+    if port_is_bound "$port" "$transport"; then
+      msg "carrier port ${port}/${transport}: listening locally"
+    else
+      err "carrier port ${port}/${transport}: nothing is listening locally"; ok=0
+    fi
+    if fw_rule_present "$port" "$transport"; then
+      msg "local firewall: ${port}/${transport} allowed (iptables)"
+    else
+      warn "local firewall: no ACCEPT rule found for ${port}/${transport} yet"
+    fi
+  fi
+
+  if [[ -n "$peer_ip" ]]; then
+    printf '\nPinging %s%s%s (peer tunnel IP)...\n\n' "$W" "$peer_ip" "$N"
+    if ping -c 4 -W 2 "$peer_ip"; then
+      printf '\n'; msg "tunnel link is healthy — ${peer_ip} replies."
+    else
+      printf '\n'; err "no reply from ${peer_ip}."
+      ok=0
+    fi
+  else
+    err "peer_ip not set in config."; ok=0
+  fi
+
+  if (( ok == 0 )); then
+    printf '\n%sNot connected — check these, in order:%s\n' "${BOLD}${Y}" "$N"
+    printf '  1. Run this same check (menu %s4%s) on the OTHER server too — BOTH ends must be\n' "$C" "$N"
+    printf '     healthy; a tunnel is only as good as its worse side.\n'
+    printf '  2. cipher / transport / obfuscation / key must be IDENTICAL on both servers\n'
+    printf '     (compare with option 6, Show config, on each side) — any mismatch fails\n'
+    printf '     silently, with no error either side.\n'
+    printf '  3. %sOpen the SAME port (%s/%s) in your cloud provider'"'"'s OWN firewall%s — Hetzner\n' \
+           "$BOLD" "$port" "$transport" "$N"
+    printf '     Cloud Firewall, an AWS/DigitalOcean/Arvan Security Group, etc. This script\n'
+    printf '     only manages the OS firewall (iptables/ufw); a closed provider-level\n'
+    printf '     firewall is the single most common reason two freshly-configured servers\n'
+    printf '     can'"'"'t reach each other even though everything above looks correct.\n'
+    printf '  4. If %s is being throttled/blocked by an ISP/DPI on the path, try the other\n' "$transport"
+    printf '     transport, or the Anti-DPI hardening / zapret menus (options 11 / 14).\n'
+    printf '  5. journalctl -u aestun -n 100 — look for auth_fail / handshake errors, which\n'
+    printf '     point at a key or cipher mismatch specifically.\n'
+    return 1
+  fi
+  printf '\n'; msg "Everything checks out on this side."
+  return 0
+}
+
+test_conn() {
+  hdr "Connectivity test & diagnostics"
+  diag_report
   pause
 }
 
@@ -1000,13 +1310,13 @@ netopt_menu() {
   ${C}3${N}) remove tuning
   ${C}0${N}) back
 EOF
-    local __c; __c="$(ask 'Choose' '')" || { clear; exit 0; }
+    local __c; __c="$(ask 'Choose' '0')" || { clear; exit 0; }
     case "$__c" in
       1) show_network_opt; pause ;;
       2)
         local cc buf fwd
-        cc="$(ask 'Congestion control (bbr/cubic)' 'bbr')"
-        buf="$(ask 'Max socket buffer size in bytes' '16777216')"
+        cc="$(ask_choice "Congestion control" "bbr" "bbr" "cubic")"
+        buf="$(ask_int 'Max socket buffer size in bytes' '16777216')"
         if ask_yn 'Enable IP forwarding' 'Y'; then fwd=1; else fwd=0; fi
         apply_network_opt "$cc" "$buf" "$fwd"; pause ;;
       3) remove_network_opt; pause ;;
@@ -1092,6 +1402,9 @@ Wants=network-online.target
 # It has to precede aestun so the NFQUEUE rule is in place when the carrier flow
 # opens — started afterwards, the flow is already past the connbytes window.
 Before=aestun.service
+# Same reasoning as aestun.service: don't let systemd's default crash-loop rate limit
+# turn a transient failure into a permanently-failed, never-retried unit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -1106,8 +1419,8 @@ ExecStartPre=${MGR_DST} zap-rule add
 #   them before aestun sees them. Without it they cross the whole path only to be
 #   rejected by AEAD auth, wasting bandwidth and inflating auth_fail.
 ExecStart=${ZAP_BIN} --qnum=${qnum} ${desync}
-ExecStartPost=${MGR_DST} zap-rule rearm
-ExecStopPost=${MGR_DST} zap-rule del
+ExecStartPost=-${MGR_DST} zap-rule rearm
+ExecStopPost=-${MGR_DST} zap-rule del
 Restart=always
 RestartSec=3
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
@@ -1190,7 +1503,7 @@ zapret_menu() {
   ${C}5${N}) remove completely
   ${C}0${N}) back
 EOF
-    local __c; __c="$(ask 'Choose' '')" || { clear; exit 0; }
+    local __c; __c="$(ask 'Choose' '0')" || { clear; exit 0; }
     case "$__c" in
       1) zap_install ;;
       2) zap_enable ;;
@@ -1206,7 +1519,16 @@ EOF
 # --------------------------------------------------------------------- uninstall
 uninstall_all() {
   hdr "Uninstall tunnel"
-  confirm "Are you sure? service, binary and config will be removed" || return
+  # BUG FIX / requested change: this used to ask up to 4 separate y/N questions (main,
+  # network tuning, config dir, zapret dir) — a single "y" no longer removed everything,
+  # it just started a chain of extra prompts. One confirmation now removes EVERYTHING:
+  # service, binary, config, zapret, and network tuning, with nothing left to clean up
+  # by hand and nothing further asked.
+  if ! confirm "Remove EVERYTHING aestun installed (service, binary, config, zapret, network tuning)? This cannot be undone"; then
+    warn "Cancelled — nothing was removed."
+    pause
+    return
+  fi
   local port; port="$(json_get "$CONF" listen)"; port="${port##*:}"
   local transport; transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
   local iface; iface="$(json_get "$CONF" tun_name)"; iface="${iface:-tun0}"
@@ -1218,9 +1540,9 @@ uninstall_all() {
   systemctl daemon-reload
   ip link del "$iface" 2>/dev/null || true
   [[ -n "$port" ]] && close_firewall "$port" "$transport"
-  confirm "Remove network optimization (sysctl tuning) too?" && remove_network_opt
-  confirm "Delete config directory ${CONF_DIR}?" && rm -rf "$CONF_DIR"
-  confirm "Delete zapret directory ${ZAPRET_DIR}?" && rm -rf "$ZAPRET_DIR"
+  remove_network_opt
+  rm -rf "$CONF_DIR"
+  rm -rf "$ZAPRET_DIR"
   msg "Everything removed."
   pause
 }
@@ -1292,7 +1614,7 @@ dpi_menu() {
   ${C}7${N}) Clear the log
   ${C}0${N}) Back
 EOF
-    local c; c="$(ask 'Choose' '')" || return
+    local c; c="$(ask 'Choose' '0')" || return
     case "$c" in
       1) clear; "$BIN_DST" dpi-report -log "$lp" -hours 24 2>&1 | ${PAGER:-less} -R ;;
       2) clear; "$BIN_DST" dpi-report -log "$lp" -hours 168 2>&1 | ${PAGER:-less} -R ;;
@@ -1409,7 +1731,7 @@ antidpi_menu() {
   ${C}5${N}) set port-hopping ports
   ${C}0${N}) back (restart to apply)
 EOF
-    local c; c="$(ask 'Choose' '')" || return
+    local c; c="$(ask 'Choose' '0')" || return
     case "$c" in
       1) if [[ "$state" == *desync=on* ]]; then antidpi_set desync false; else antidpi_set desync true; fi ;;
       2) if [[ "$state" == *junk=on* ]]; then antidpi_set junk false; else antidpi_set junk true; fi ;;
@@ -1664,24 +1986,24 @@ main_menu() {
     status_line
     cat <<EOF
 
-  ${C}1${N}) Setup / reconfigure tunnel (wizard)
-  ${C}2${N}) Live monitoring dashboard
-  ${C}3${N}) Service management (start/stop/restart/...)
-  ${C}4${N}) Connectivity test (ping through tunnel)
-  ${C}5${N}) Live logs
-  ${C}6${N}) Show config
-  ${C}7${N}) Edit config
-  ${C}8${N}) Generate new key
-  ${C}9${N}) Network optimization
-  ${C}d${N}) DPI / probe log            <- who is probing, what the path is doing
-  ${C}x${N}) Anti-DPI hardening         <- desync / junk / port-hop / split (native, §15)
-  ${C}t${N}) Auto-test methods          <- sweep every method/protocol, apply the best (§16)
-  ${C}f${N}) Port forwarding            <- expose ports on this server, forwarded over the tunnel
-  ${C}z${N}) zapret module (DPI bypass)
-  ${C}u${N}) Uninstall tunnel
-  ${C}0${N}) Exit
+  ${C}1${N})  Setup / reconfigure tunnel (wizard)
+  ${C}2${N})  Live monitoring dashboard
+  ${C}3${N})  Service management (start/stop/restart/status)
+  ${C}4${N})  Connectivity test & diagnostics
+  ${C}5${N})  Live logs
+  ${C}6${N})  Show config
+  ${C}7${N})  Edit config
+  ${C}8${N})  Generate new key
+  ${C}9${N})  Network optimization
+  ${C}10${N}) DPI / probe log            ${D}— who is probing, what the path is doing${N}
+  ${C}11${N}) Anti-DPI hardening         ${D}— desync / junk / port-hop / split${N}
+  ${C}12${N}) Auto-test methods          ${D}— sweep every method/protocol, apply the best${N}
+  ${C}13${N}) Port forwarding            ${D}— expose a port here, forwarded over the tunnel${N}
+  ${C}14${N}) zapret module (DPI bypass)
+  ${C}15${N}) Uninstall tunnel
+  ${C}0${N})  Exit                       ${D}(Enter)${N}
 EOF
-    local __c; __c="$(ask 'Choose' '')" || { clear; exit 0; }
+    local __c; __c="$(ask 'Choose' '0')" || { clear; exit 0; }
     case "$__c" in
       1) interactive_setup; pause ;;
       2) monitor ;;
@@ -1692,12 +2014,12 @@ EOF
       7) edit_config ;;
       8) do_keygen ;;
       9) netopt_menu ;;
-      d|D) dpi_menu ;;
-      x|X) antidpi_menu ;;
-      t|T) autotest ;;
-      f|F) fwd_menu ;;
-      z|Z) zapret_menu ;;
-      u|U) uninstall_all ;;
+      10) dpi_menu ;;
+      11) antidpi_menu ;;
+      12) autotest ;;
+      13) fwd_menu ;;
+      14) zapret_menu ;;
+      15) uninstall_all ;;
       0) clear; exit 0 ;;
       *) warn "invalid option"; sleep 1 ;;
     esac
@@ -1822,107 +2144,21 @@ do_upgrade() {
   mkdir -p "$bak"
   cp -a "$CONF" "$bak/config.json"
   [[ -f "$BIN_DST" ]] && cp -a "$BIN_DST" "$bak/aestun.bin"
+  [[ -f "$SERVICE" ]] && cp -a "$SERVICE" "$bak/aestun.service"
   msg "Rolled-back copies saved in $bak"
 
   ensure_binary || { err "no binary available"; return 1; }
+
+  # BUG FIX: refresh the systemd unit too (not just config/binary) so an already-
+  # installed server picks up service-hardening fixes — currently StartLimitIntervalSec=0,
+  # so a crash-loop can never leave systemd permanently refusing to restart the tunnel —
+  # without requiring a full reinstall.
+  write_service
+  systemctl daemon-reload
 
   # --- cipher ---
   local cur rec hw cpuname
   cur="$(json_get "$CONF" cipher)"; cur="${cur:-aes-gcm}"
   rec="$("$BIN_DST" cipherinfo 2>/dev/null | tail -1)"; rec="${rec:-aes-gcm}"
   hw="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^aes_hardware=//p')"
-  cpuname="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^cpu=//p')"
-  printf '\n%sCipher%s  current: %s%s%s\n' "$BOLD" "$N" "$W" "$cur" "$N"
-  printf '  this CPU: %s  (AES hardware: %s)\n' "${cpuname:-unknown}" "${hw:-unknown}"
-  if [[ "$hw" != "true" ]]; then
-    printf '  %sThis CPU has no AES-NI. AES-GCM runs in software here and will dominate CPU use.%s\n' "$Y" "$N"
-  fi
-  printf '  %sBoth servers must use the same value, and the link is only as fast as its slower\n' "$D"
-  printf '  end — so if EITHER side lacks AES-NI, set chacha20-poly1305 on BOTH.%s\n' "$N"
-  local newc; newc="$(ask "Cipher (aes-gcm/chacha20-poly1305)" "$cur")"
-  [[ "$newc" == "aes-gcm" || "$newc" == "chacha20-poly1305" ]] || {
-    warn "Unknown cipher '$newc' — keeping $cur."; newc="$cur"; }
-
-  # --- dpi log ---
-  local dpion=true
-  ask_yn "Enable DPI/probe logging" "Y" || dpion=false
-
-  python3 - "$CONF" "$newc" "$dpion" "$DPI_LOG" <<'PY'
-import json,sys
-path,cipher,dpion,logpath=sys.argv[1],sys.argv[2],sys.argv[3]=="true",sys.argv[4]
-c=json.load(open(path))
-c["cipher"]=cipher
-d=c.setdefault("dpi_log",{})
-d["enabled"]=dpion
-d.setdefault("path",logpath)
-d.setdefault("probe",True)
-json.dump(c,open(path,"w"),indent=2)
-PY
-  chmod 600 "$CONF"
-  msg "Config updated (cipher=$newc, dpi_log.enabled=$dpion)."
-
-  if [[ "$newc" != "$cur" ]]; then
-    printf '\n%sThe cipher changed. The two ends will not talk until the OTHER server is set to\n' "$Y"
-    printf '%s as well — expect the tunnel to be down until you do that.%s\n' "$newc" "$N"
-    confirm "Restart aestun now anyway" || { warn "Not restarting. Run: systemctl restart aestun"; return 0; }
-  fi
-  systemctl restart aestun && msg "aestun restarted." || err "restart failed — see: journalctl -u aestun -n 50"
-  sleep 2
-  systemctl is-active --quiet aestun && msg "service is active." || {
-    err "service is not active. Roll back with:"
-    printf '   cp %s/config.json %s && cp %s/aestun.bin %s && systemctl restart aestun\n' "$bak" "$CONF" "$bak" "$BIN_DST"
-  }
-}
-
-# =============================================================================
-#  installer entry (was install.sh)
-# =============================================================================
-do_install() {
-  need_root
-  printf '%s\n' "${BOLD}${C}"
-  cat <<'BANNER'
-   +---------------------------------------------+
-   |   aestun — AES-256-GCM anti-DPI tunnel      |
-   |   server-to-server installer                |
-   +---------------------------------------------+
-BANNER
-  printf '%s\n' "${N}"
-  interactive_setup || { err "Setup aborted (no input / cancelled). Nothing was changed."; exit 1; }
-  # Make this script callable by systemd for the zapret rule helper and forwarding helper.
-  install -m 0755 "$SELF" "$MGR_DST" 2>/dev/null || true
-  printf '\n%sQuick checks:%s\n' "$BOLD" "$N"
-  printf '   systemctl status aestun\n'
-  printf '   journalctl -u aestun -f\n'
-  printf '   %s            %s(management menu + live monitor)%s\n' "$SELF" "$D" "$N"
-}
-
-# =============================================================================
-#  dispatcher
-# =============================================================================
-case "${1:-menu}" in
-  zap-rule) shift; zap_rule "$@"; exit $? ;;   # systemd path — no menu, no root prompt
-  fwd-rule) shift; fwd_rule "$@"; exit $? ;;   # systemd path — no menu, no root prompt
-  fetch-core) fetch_core; exit $? ;;           # download Go source + prebuilt binaries from upstream
-  build)    shift; do_build "$@"; exit $? ;;
-  dpi-report) shift; "$BIN_DST" dpi-report -config "$CONF" "$@"; exit $? ;;
-  install)  need_root; auto_bootstrap; do_install; exit $? ;;
-  upgrade)  do_upgrade; exit $? ;;
-  menu|"")  need_root; auto_bootstrap; install -m 0755 "$SELF" "$MGR_DST" 2>/dev/null || true; main_menu ;;
-  -h|--help|help)
-    cat <<'USAGE'
-aestun.sh — one file, one command: auto-fetches the Go core + prebuilt binaries on
-first run, then installer + manager + monitor + zapret + build + port-forward.
-
-  sudo ./aestun.sh              first run: auto-downloads the core, then opens the menu
-  sudo ./aestun.sh install      interactive installer (run on each server)
-  sudo ./aestun.sh upgrade      move an existing install to a new binary/config
-  ./aestun.sh build [arch] [pprof|obfuscate]
-                                cross-compile a static binary (dev machine)
-  ./aestun.sh dpi-report        summarise the DPI/probe log
-  ./aestun.sh zap-rule VERB     NFQUEUE helper {add|del|rearm}, invoked by systemd
-  ./aestun.sh fwd-rule VERB     Port-forward DNAT helper {add|del}, invoked by systemd
-  ./aestun.sh fetch-core        download Go source + prebuilt binaries from upstream
-USAGE
-    exit 0 ;;
-  *) err "unknown command: $1  (try: install | menu | zap-rule | fwd-rule | fetch-core | build)"; exit 1 ;;
-esac
+  cpuname="$("
