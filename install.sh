@@ -39,7 +39,7 @@ CORE_REPO_ZIP="https://github.com/3aeidkhalili/AES-256-GCM-anti-DPI/archive/refs
 # between the two servers. These two defaults remove that back-and-forth: unless you
 # override them, setup no longer asks for the shared key or the tunnel port at all.
 # Override per-run without editing the file:
-#   AESTUN_PSK="$(head -c32 /dev/urandom | base64)" AESTUN_PORT=51820 sudo -E ./aestun.sh install
+#   AESTUN_PSK="$(head -c32 /dev/urandom | base64)" AESTUN_PORT=2087 sudo -E ./aestun.sh install
 # (sudo drops the environment unless you pass -E — or run as root directly.)
 #
 # SECURITY NOTE about DEFAULT_PSK_PLACEHOLDER: it is baked into every copy of this file.
@@ -51,9 +51,9 @@ CORE_REPO_ZIP="https://github.com/3aeidkhalili/AES-256-GCM-anti-DPI/archive/refs
 #   - edit the string below, once, to your own `head -c32 /dev/urandom | base64`, or
 #   - export AESTUN_PSK (see above) every time you run this script.
 # Either way, both servers must end up with the SAME value.
-DEFAULT_PSK_PLACEHOLDER="htGTLsF6vxtBF7LWPMz5/+80zIeuX22wwKCbtpGQsj4="
+DEFAULT_PSK_PLACEHOLDER="gDfGvhlFAwaNB72O8/CrtbG6g6JnQjmJCIeSFtPRxMg="
 DEFAULT_PSK="${AESTUN_PSK:-$DEFAULT_PSK_PLACEHOLDER}"
-DEFAULT_PORT="${AESTUN_PORT:-51820}"
+DEFAULT_PORT="${AESTUN_PORT:-2087}"
 
 # ------------------------------------------------------------------------- colors
 if [[ -t 1 ]]; then
@@ -935,7 +935,7 @@ interactive_setup() {
   # --- network endpoints — port is not asked anymore, see DEFAULT_PORT near the top ---
   printf '\n'
   CFG_LISTEN_PORT="$DEFAULT_PORT"
-  is_port "$CFG_LISTEN_PORT" || CFG_LISTEN_PORT=51820
+  is_port "$CFG_LISTEN_PORT" || CFG_LISTEN_PORT=2087
   printf '%s listen port on THIS server: %s%s%s (not asked — set AESTUN_PORT to change it)\n' \
     "${CFG_TRANSPORT^^}" "$C" "$CFG_LISTEN_PORT" "$N"
   local phost pport
@@ -2256,7 +2256,7 @@ first run, then installer + manager + monitor + zapret + build + port-forward.
 Setup no longer asks for the shared key (PSK) or the tunnel port — it reuses an
 existing key/port, otherwise falls back to a built-in default. Override either
 without editing the file:
-  AESTUN_PSK="$(head -c32 /dev/urandom | base64)" AESTUN_PORT=51820 sudo -E ./aestun.sh install
+  AESTUN_PSK="$(head -c32 /dev/urandom | base64)" AESTUN_PORT=2087 sudo -E ./aestun.sh install
 (sudo drops the environment unless you pass -E.) See the DEFAULT_PSK/DEFAULT_PORT
 comment near the top of this file for the security note about the built-in PSK.
 USAGE
