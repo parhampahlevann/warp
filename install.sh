@@ -2161,4 +2161,105 @@ do_upgrade() {
   cur="$(json_get "$CONF" cipher)"; cur="${cur:-aes-gcm}"
   rec="$("$BIN_DST" cipherinfo 2>/dev/null | tail -1)"; rec="${rec:-aes-gcm}"
   hw="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^aes_hardware=//p')"
-  cpuname="$("
+  cpuname="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^cpu=//p')"
+  printf '\n%sCipher%s  current: %s%s%s\n' "$BOLD" "$N" "$W" "$cur" "$N"
+  printf '  this CPU: %s  (AES hardware: %s)\n' "${cpuname:-unknown}" "${hw:-unknown}"
+  if [[ "$hw" != "true" ]]; then
+    printf '  %sThis CPU has no AES-NI. AES-GCM runs in software here and will dominate CPU use.%s\n' "$Y" "$N"
+  fi
+  printf '  %sBoth servers must use the same value, and the link is only as fast as its slower\n' "$D"
+  printf '  end — so if EITHER side lacks AES-NI, set chacha20-poly1305 on BOTH.%s\n' "$N"
+  local newc; newc="$(ask "Cipher (aes-gcm/chacha20-poly1305)" "$cur")"
+  [[ "$newc" == "aes-gcm" || "$newc" == "chacha20-poly1305" ]] || {
+    warn "Unknown cipher '$newc' — keeping $cur."; newc="$cur"; }
+
+  # --- dpi log ---
+  local dpion=true
+  ask_yn "Enable DPI/probe logging" "Y" || dpion=false
+
+  python3 - "$CONF" "$newc" "$dpion" "$DPI_LOG" <<'PY'
+import json,sys
+path,cipher,dpion,logpath=sys.argv[1],sys.argv[2],sys.argv[3]=="true",sys.argv[4]
+c=json.load(open(path))
+c["cipher"]=cipher
+d=c.setdefault("dpi_log",{})
+d["enabled"]=dpion
+d.setdefault("path",logpath)
+d.setdefault("probe",True)
+json.dump(c,open(path,"w"),indent=2)
+PY
+  chmod 600 "$CONF"
+  msg "Config updated (cipher=$newc, dpi_log.enabled=$dpion)."
+
+  if [[ "$newc" != "$cur" ]]; then
+    printf '\n%sThe cipher changed. The two ends will not talk until the OTHER server is set to\n' "$Y"
+    printf '%s as well — expect the tunnel to be down until you do that.%s\n' "$newc" "$N"
+    confirm "Restart aestun now anyway" || { warn "Not restarting. Run: systemctl restart aestun"; return 0; }
+  fi
+  systemctl restart aestun && msg "aestun restarted." || err "restart failed — see: journalctl -u aestun -n 50"
+  sleep 2
+  systemctl is-active --quiet aestun && msg "service is active." || {
+    err "service is not active. Roll back with:"
+    printf '   cp %s/config.json %s && cp %s/aestun.bin %s && systemctl restart aestun\n' "$bak" "$CONF" "$bak" "$BIN_DST"
+  }
+}
+
+# =============================================================================
+#  installer entry (was install.sh)
+# =============================================================================
+do_install() {
+  need_root
+  printf '%s\n' "${BOLD}${C}"
+  cat <<'BANNER'
+   +---------------------------------------------+
+   |   aestun — AES-256-GCM anti-DPI tunnel      |
+   |   server-to-server installer                |
+   +---------------------------------------------+
+BANNER
+  printf '%s\n' "${N}"
+  interactive_setup || { err "Setup aborted (no input / cancelled). Nothing was changed."; exit 1; }
+  # Make this script callable by systemd for the zapret rule helper and forwarding helper.
+  install -m 0755 "$SELF" "$MGR_DST" 2>/dev/null || true
+  printf '\n%sQuick checks:%s\n' "$BOLD" "$N"
+  printf '   systemctl status aestun\n'
+  printf '   journalctl -u aestun -f\n'
+  printf '   %s            %s(management menu + live monitor)%s\n' "$SELF" "$D" "$N"
+}
+
+# =============================================================================
+#  dispatcher
+# =============================================================================
+case "${1:-menu}" in
+  zap-rule) shift; zap_rule "$@"; exit $? ;;   # systemd path — no menu, no root prompt
+  fwd-rule) shift; fwd_rule "$@"; exit $? ;;   # systemd path — no menu, no root prompt
+  fetch-core) fetch_core; exit $? ;;           # download Go source + prebuilt binaries from upstream
+  build)    shift; do_build "$@"; exit $? ;;
+  dpi-report) shift; "$BIN_DST" dpi-report -config "$CONF" "$@"; exit $? ;;
+  install)  need_root; auto_bootstrap; do_install; exit $? ;;
+  upgrade)  do_upgrade; exit $? ;;
+  menu|"")  need_root; auto_bootstrap; install -m 0755 "$SELF" "$MGR_DST" 2>/dev/null || true; main_menu ;;
+  -h|--help|help)
+    cat <<'USAGE'
+aestun.sh — one file, one command: auto-fetches the Go core + prebuilt binaries on
+first run, then installer + manager + monitor + zapret + build + port-forward.
+
+  sudo ./aestun.sh              first run: auto-downloads the core, then opens the menu
+  sudo ./aestun.sh install      interactive installer (run on each server)
+  sudo ./aestun.sh upgrade      move an existing install to a new binary/config
+  ./aestun.sh build [arch] [pprof|obfuscate]
+                                cross-compile a static binary (dev machine)
+  ./aestun.sh dpi-report        summarise the DPI/probe log
+  ./aestun.sh zap-rule VERB     NFQUEUE helper {add|del|rearm}, invoked by systemd
+  ./aestun.sh fwd-rule VERB     Port-forward DNAT helper {add|del}, invoked by systemd
+  ./aestun.sh fetch-core        download Go source + prebuilt binaries from upstream
+
+Setup no longer asks for the shared key (PSK) or the tunnel port — it reuses an
+existing key/port, otherwise falls back to a built-in default. Override either
+without editing the file:
+  AESTUN_PSK="$(head -c32 /dev/urandom | base64)" AESTUN_PORT=51820 sudo -E ./aestun.sh install
+(sudo drops the environment unless you pass -E.) See the DEFAULT_PSK/DEFAULT_PORT
+comment near the top of this file for the security note about the built-in PSK.
+USAGE
+    exit 0 ;;
+  *) err "unknown command: $1  (try: install | menu | zap-rule | fwd-rule | fetch-core | build)"; exit 1 ;;
+esac
