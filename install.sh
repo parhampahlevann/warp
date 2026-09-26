@@ -117,6 +117,12 @@ ask_yn() {
 
 is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+# looks_like_bare_port STR -> true if STR is just digits (no dots/letters) — i.e. it's
+# almost certainly a port number typed where a host/IP was expected. This is exactly how
+# "peer": "51820:51820" happens: the wizard asks for the OTHER server's host, and if a
+# port number is typed there by mistake, CFG_PEER ends up "<port>:<port>" and the daemon
+# spends forever trying (and failing) to resolve a hostname that is really just a number.
+looks_like_bare_port() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
 # ask_int "prompt" "default" -> a non-negative integer; falls back to default on non-numeric input.
 ask_int() {
@@ -320,12 +326,24 @@ write_service() {
 Description=aestun - AES-256-GCM obfuscated server-to-server tunnel
 After=network-online.target
 Wants=network-online.target
+# BUG FIX: systemd's default start-rate limit (5 restarts / 10s) means Restart=always
+# quietly stops meaning "always" the moment the daemon crash-loops even briefly (a bad
+# rekey, an OOM blip, a transient DNS failure resolving the peer host) — the unit lands
+# in "failed" and stays down until someone runs systemctl reset-failed / restarts it by
+# hand. From the outside that is indistinguishable from "the tunnel disconnected and
+# never came back on its own", which is exactly the symptom to avoid. Disabling the
+# limit here means it keeps retrying forever, which is what a tunnel daemon with
+# Restart=always should actually do.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${BIN_DST} -config ${CONF}
-ExecStartPost=${MGR_DST} fwd-rule add
-ExecStopPost=${MGR_DST} fwd-rule del
+# "-" prefix: a hiccup in the (optional) port-forwarding hook must never take the whole
+# tunnel down. Without it, ExecStartPost failing (e.g. peer_ip briefly blank during an
+# edit) marks this entire unit failed even though the tunnel binary itself started fine.
+ExecStartPost=-${MGR_DST} fwd-rule add
+ExecStopPost=-${MGR_DST} fwd-rule del
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -837,7 +855,13 @@ interactive_setup() {
   printf '\n%sCarrier transport%s — udp is strongly preferred.\n' "$BOLD" "$N"
   printf '  %sudp%s: a lost packet affects only the connection it carried\n' "$C" "$N"
   printf '  %stcp%s: survives UDP-blocking networks, but one loss stalls every connection\n' "$C" "$N"
-  CFG_TRANSPORT="$(ask "Transport (udp/tcp)" "tcp")"
+  # BUG FIX: the three lines above this recommend UDP explicitly, but the default answer
+  # passed to `ask` was "tcp" — so just pressing Enter silently picked the transport this
+  # menu tells you NOT to pick. Over a lossy path (very common in Iran) TCP-over-TCP
+  # head-of-line-blocking is a strong, concrete way a tunnel "stalls/drops after a while
+  # under load" without the service itself ever crashing. Default now matches the advice;
+  # run auto-test (menu option t) to confirm which is actually best on your specific path.
+  CFG_TRANSPORT="$(ask "Transport (udp/tcp)" "udp")"
   [[ "$CFG_TRANSPORT" == "udp" || "$CFG_TRANSPORT" == "tcp" ]] || {
     warn "Unknown transport '$CFG_TRANSPORT' — using udp."; CFG_TRANSPORT="udp"; }
 
@@ -864,6 +888,20 @@ interactive_setup() {
     "${CFG_TRANSPORT^^}" "$C" "$CFG_LISTEN_PORT" "$N"
   local phost pport
   phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
+  # BUG FIX: this is the exact input that produced "peer": "51820:51820" in the field —
+  # a port number (or a "host:port" pair) typed here instead of a bare host/IP. Loop
+  # until the answer at least looks like an address, instead of writing garbage into
+  # config.json that the daemon will spend hours failing to resolve.
+  while looks_like_bare_port "$phost" || [[ "$phost" == *:* ]]; do
+    if [[ "$phost" == *:* ]]; then
+      err "  '$phost' includes a ':' — enter ONLY the OTHER server's IP or domain, with"
+      err "  no port; the port is added automatically."
+    else
+      err "  '$phost' looks like a port number, not an address — enter the OTHER server's"
+      err "  public IP or domain (e.g. 203.0.113.7 or vpn2.example.com), not a port."
+    fi
+    phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
+  done
   pport="$CFG_LISTEN_PORT"
   printf '%s port of the OTHER server: %s%s%s (assumed the same as above — not asked)\n' \
     "${CFG_TRANSPORT^^}" "$C" "$pport" "$N"
@@ -1076,6 +1114,23 @@ test_conn() {
   local peer_ip; peer_ip="$(json_get "$CONF" peer_ip)"
   hdr "Connectivity test over the tunnel"
   [[ -z "$peer_ip" ]] && { err "peer_ip not set in config."; pause; return; }
+
+  # Catch the exact misconfiguration that causes silent, permanent RX=0: a bare port
+  # number (or a leftover "host:port" pair) saved as the peer's HOST instead of its
+  # address — the daemon then spends forever trying to resolve a hostname that's just
+  # a number, and this test would otherwise just report a plain, unexplained ping failure.
+  local peer host
+  peer="$(json_get "$CONF" peer)"; host="${peer%:*}"
+  if [[ -n "$host" ]]; then
+    if looks_like_bare_port "$host"; then
+      err "config 'peer' host is '${host}' — that's a port number, not an address. Fix it"
+      err "in option 7 (Edit config) or re-run setup (option 1) before testing further."
+    elif command -v getent >/dev/null 2>&1 && ! getent hosts "$host" >/dev/null 2>&1 \
+         && [[ ! "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      warn "config 'peer' host '${host}' does not resolve right now."
+    fi
+  fi
+
   printf 'Pinging %s%s%s (peer tunnel IP)...\n\n' "$W" "$peer_ip" "$N"
   if ping -c 4 -W 2 "$peer_ip"; then
     printf '\n'; msg "Tunnel link is healthy."
@@ -1217,6 +1272,9 @@ Wants=network-online.target
 # It has to precede aestun so the NFQUEUE rule is in place when the carrier flow
 # opens — started afterwards, the flow is already past the connbytes window.
 Before=aestun.service
+# Same reasoning as aestun.service: don't let systemd's default crash-loop rate limit
+# turn a transient failure into a permanently-failed, never-retried unit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -1231,8 +1289,8 @@ ExecStartPre=${MGR_DST} zap-rule add
 #   them before aestun sees them. Without it they cross the whole path only to be
 #   rejected by AEAD auth, wasting bandwidth and inflating auth_fail.
 ExecStart=${ZAP_BIN} --qnum=${qnum} ${desync}
-ExecStartPost=${MGR_DST} zap-rule rearm
-ExecStopPost=${MGR_DST} zap-rule del
+ExecStartPost=-${MGR_DST} zap-rule rearm
+ExecStopPost=-${MGR_DST} zap-rule del
 Restart=always
 RestartSec=3
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
@@ -1947,9 +2005,17 @@ do_upgrade() {
   mkdir -p "$bak"
   cp -a "$CONF" "$bak/config.json"
   [[ -f "$BIN_DST" ]] && cp -a "$BIN_DST" "$bak/aestun.bin"
+  [[ -f "$SERVICE" ]] && cp -a "$SERVICE" "$bak/aestun.service"
   msg "Rolled-back copies saved in $bak"
 
   ensure_binary || { err "no binary available"; return 1; }
+
+  # BUG FIX: refresh the systemd unit too (not just config/binary) so an already-
+  # installed server picks up service-hardening fixes — currently StartLimitIntervalSec=0,
+  # so a crash-loop can never leave systemd permanently refusing to restart the tunnel —
+  # without requiring a full reinstall.
+  write_service
+  systemctl daemon-reload
 
   # --- cipher ---
   local cur rec hw cpuname
