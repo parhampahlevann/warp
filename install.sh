@@ -1241,6 +1241,106 @@ diag_report() {
     err "peer_ip not set in config."; ok=0
   fi
 
+  # -----------------------------------------------------------------------
+  # Performance diagnosis: "it connects, but ping is high / lossy" is a DIFFERENT
+  # problem from reachability above, and has several distinct possible causes.
+  # This isolates WHERE the loss/latency is coming from instead of guessing.
+  # -----------------------------------------------------------------------
+  if [[ -n "$peer_ip" && "$svc_state" == "active" ]]; then
+    printf '\n'; hdr "Performance: raw path vs. tunnel path"
+    printf '%sCompares the OTHER server'"'"'s real public address (no tunnel) against the\n' "$D"
+    printf 'tunnel IP (%s) — this tells you whether the loss/latency already exists on\n' "$peer_ip"
+    printf 'the underlying network path, or is being ADDED by the tunnel/its extra modules.%s\n' "$N"
+
+    local raw_loss="" raw_rtt="" tun_loss="" tun_rtt=""
+    if [[ -n "$host" ]] && ! looks_like_bare_port "$host"; then
+      local raw_out; raw_out="$(ping -c 10 -W 2 "$host" 2>/dev/null)"
+      raw_loss="$(printf '%s' "$raw_out" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1)"
+      raw_rtt="$(printf '%s' "$raw_out" | sed -nE 's#.*= [0-9.]+/([0-9.]+)/.*#\1#p' | head -1)"
+      printf '\n  RAW    (%s, public IP) : ' "$host"
+      if [[ -n "$raw_loss" && "$raw_loss" != "100" ]]; then
+        printf 'loss %s%%, avg rtt %s ms\n' "$raw_loss" "${raw_rtt:--}"
+      else
+        printf '%sno reply — ICMP is likely just blocked by the provider here; inconclusive%s\n' "$D" "$N"
+        raw_loss=""
+      fi
+    fi
+    local tun_out; tun_out="$(ping -c 10 -W 2 "$peer_ip" 2>/dev/null)"
+    tun_loss="$(printf '%s' "$tun_out" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1)"
+    tun_rtt="$(printf '%s' "$tun_out" | sed -nE 's#.*= [0-9.]+/([0-9.]+)/.*#\1#p' | head -1)"
+    printf '  TUNNEL (%s, over the tunnel): loss %s%%, avg rtt %s ms\n' \
+      "$peer_ip" "${tun_loss:-?}" "${tun_rtt:--}"
+
+    local worse=0
+    if [[ -n "$raw_loss" && -n "$tun_loss" ]]; then
+      awk "BEGIN{exit !(${tun_loss:-0} > ${raw_loss:-0} + 5 || (${tun_rtt:-0}+0) > (${raw_rtt:-0}+0)*3 + 10)}" \
+        && worse=1
+    fi
+
+    if (( worse == 1 )); then
+      warn "The tunnel is measurably worse than the raw path — something below is ADDING it:"
+    elif [[ -n "$raw_loss" ]]; then
+      msg "Tunnel performance is roughly in line with the raw path — the loss/latency is most"
+      msg "likely already on the underlying network (ISP/route/DPI throttling), not this script."
+    else
+      printf '  %s(no usable raw-path baseline — ICMP blocked; checking known culprits anyway)%s\n' "$D" "$N"
+    fi
+
+    # Known, concrete causes this script can introduce — check each and say so.
+    local hit=0
+    local adp; adp="$(antidpi_state 2>/dev/null)"
+    if [[ "$adp" == *=on* ]]; then
+      warn "  - Anti-DPI hardening has module(s) ON (${adp}) — desync/junk/hop/split all inject"
+      warn "    extra packets and can add real loss. Menu 11 -> toggle each off one at a time to isolate."
+      hit=1
+    fi
+    if zap_installed && [[ "$(svc_active aestun-zapret)" == "active" ]]; then
+      warn "  - zapret is running (menu 14) — its fake-packet injection is documented to add"
+      warn "    measurable loss on its own. Try menu 14 -> 3 (disable) and re-test."
+      hit=1
+    fi
+    if [[ "$transport" == "tcp" ]]; then
+      warn "  - transport is tcp — one lost carrier segment head-of-line-blocks everything at"
+      warn "    once, turning ordinary loss into big latency spikes. Prefer udp unless it's blocked."
+      hit=1
+    fi
+    if [[ -x "$BIN_DST" ]]; then
+      local cur_cipher hw; cur_cipher="$(json_get "$CONF" cipher)"; cur_cipher="${cur_cipher:-aes-gcm}"
+      hw="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^aes_hardware=//p')"
+      if [[ "$cur_cipher" == "aes-gcm" && "$hw" != "true" ]]; then
+        warn "  - cipher is aes-gcm but this CPU has no AES-NI — encryption runs in software and"
+        warn "    can bottleneck the CPU (queueing = latency) under any real packet rate. Switch"
+        warn "    BOTH servers to chacha20-poly1305 (menu 7, edit \"cipher\", restart both)."
+        hit=1
+      fi
+    fi
+    local cc; cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    if [[ "$cc" != "bbr" ]]; then
+      warn "  - congestion control is '${cc:-unknown}', not bbr (menu 9) — stock buffers/cubic"
+      warn "    bufferbloat under any load; applying network optimization often cuts this a lot."
+      hit=1
+    fi
+    if grep -q '"hop"' "$CONF" 2>/dev/null; then
+      local hop_on; hop_on="$(python3 -c "import json;print(bool(json.load(open('$CONF')).get('hop',{}).get('enabled')))" 2>/dev/null)"
+      if [[ "$hop_on" == "True" ]]; then
+        local hp missing=() p
+        hp="$(python3 -c "import json;print(','.join(str(x) for x in json.load(open('$CONF')).get('hop',{}).get('ports',[])))" 2>/dev/null)"
+        for p in ${hp//,/ }; do fw_rule_present "$p" "$transport" || missing+=("$p"); done
+        if (( ${#missing[@]} > 0 )); then
+          warn "  - port hopping is ON but these hop ports have NO local firewall ACCEPT rule yet:"
+          warn "    ${missing[*]} — every time the carrier hops onto one of these, traffic silently"
+          warn "    drops. Also confirm all hop ports are open in the cloud provider's firewall too."
+          hit=1
+        fi
+      fi
+    fi
+    if (( hit == 0 && worse == 1 )); then
+      warn "  - none of the usual suspects above are active; check CPU load (top) and bandwidth"
+      warn "    usage on BOTH servers during the bad ping, and consider menu 12 (Auto-test) to"
+      warn "    sweep transports/methods and measure loss under a sustained window automatically."
+    fi
+  fi
+
   if (( ok == 0 )); then
     printf '\n%sNot connected — check these, in order:%s\n' "${BOLD}${Y}" "$N"
     printf '  1. Run this same check (menu %s4%s) on the OTHER server too — BOTH ends must be\n' "$C" "$N"
