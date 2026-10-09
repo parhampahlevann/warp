@@ -29,6 +29,9 @@ ZAP_BIN="${ZAPRET_DIR}/nfq/nfqws"   # built from source (upstream ships no prebu
 ZAP_SERVICE="/etc/systemd/system/aestun-zapret.service"
 ZAP_RULES="/etc/aestun/zapret-rules.sh"
 FWD_SERVICE="/etc/systemd/system/aestun-fwd.service"
+WATCHDOG_SERVICE="/etc/systemd/system/aestun-watchdog.service"
+WATCHDOG_TIMER="/etc/systemd/system/aestun-watchdog.timer"
+WATCHDOG_STATE="/run/aestun/watchdog.last"
 # Upstream source of the tunnel core (Go source + prebuilt aestun-linux-{amd64,arm64}).
 # Used as a fallback ONLY when neither a prebuilt binary nor local main.go is found
 # next to this script — see fetch_core() / ensure_binary().
@@ -370,17 +373,6 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# BUG FIX (intermittent connectivity after reboot / ufw reload / iptables flush):
-# the local firewall ACCEPT rule for the carrier port used to be added ONLY once, at
-# setup time (interactive_setup -> open_firewall). The plain `iptables -I INPUT ...`
-# fallback it adds is NOT persisted by ufw and is wiped by any reboot, `ufw reload`,
-# or anything else that flushes/rebuilds iptables — after which the carrier port is
-# silently unreachable again even though the service is "active" and listening, which
-# looks exactly like "sometimes the two servers just can't reach each other". fw-rule
-# re-adds that ACCEPT rule (and any anti-DPI hop ports) every time the unit starts, the
-# same self-healing pattern already used for the forwarding (fwd-rule) and zapret
-# (zap-rule) helpers below.
-ExecStartPre=-${MGR_DST} fw-rule add
 ExecStart=${BIN_DST} -config ${CONF}
 # "-" prefix: a hiccup in the (optional) port-forwarding hook must never take the whole
 # tunnel down. Without it, ExecStartPost failing (e.g. peer_ip briefly blank during an
@@ -493,46 +485,6 @@ fw_rule_present() {
 }
 
 # =============================================================================
-#  fw-rule — re-assert the local firewall ACCEPT rule(s) for the carrier port (and
-#  any anti-DPI hop ports) on every service start. Invoked by systemd (ExecStartPre).
-#
-#  BUG FIX: this used to only happen once, inside interactive_setup(), at install time.
-#  A reboot, a `ufw reload`/`ufw disable && enable` cycle, or anything else that
-#  flushes/rebuilds iptables (fail2ban, csf, a provider's own hardening script, a
-#  cloud-init re-run) silently drops the plain `iptables -I INPUT` fallback rule —
-#  nothing then re-adds it, and the carrier port goes quietly unreachable on that one
-#  side even though `systemctl status aestun` still says active and the socket is
-#  bound. From the other server this looks exactly like "sometimes we can't connect /
-#  can't ping each other" with no error anywhere. Re-asserting on every start makes
-#  the rule self-healing instead of a one-time, easily-lost setup step.
-# =============================================================================
-fw_rule() {
-  case "${1:-}" in
-    add)
-      [[ -f "$CONF" ]] || return 0
-      local listen port transport
-      listen="$(json_get "$CONF" listen)"; port="${listen##*:}"
-      transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
-      [[ -n "$port" ]] && open_firewall "$port" "$transport"
-      # Port-hopping rotates the carrier across a whole port set — every one of those
-      # ports needs the same ACCEPT rule, or the tunnel drops out each time it hops
-      # onto a port that lost its rule after a reboot.
-      if command -v python3 >/dev/null 2>&1 && grep -q '"hop"' "$CONF" 2>/dev/null; then
-        local hop_on
-        hop_on="$(python3 -c "import json;print(bool(json.load(open('$CONF')).get('hop',{}).get('enabled')))" 2>/dev/null)"
-        if [[ "$hop_on" == "True" ]]; then
-          local hp p
-          hp="$(python3 -c "import json;print(','.join(str(x) for x in json.load(open('$CONF')).get('hop',{}).get('ports',[])))" 2>/dev/null)"
-          for p in ${hp//,/ }; do open_firewall "$p" "$transport"; done
-        fi
-      fi
-      return 0 ;;
-    del) return 0 ;;   # deliberately a no-op: never auto-close the carrier port on stop
-    *) echo "usage: $0 fw-rule {add|del}" >&2; return 1 ;;
-  esac
-}
-
-# =============================================================================
 #  Network optimization (Ubuntu sysctl tuning for the tunnel)
 # =============================================================================
 # apply_network_opt CC BUFMAX FORWARD(0|1)
@@ -627,6 +579,33 @@ ensure_sock_buf_ceiling() {
 # independent of whether the optional full network optimization is applied.
 net.core.rmem_max = ${want}
 net.core.wmem_max = ${want}
+EOF
+}
+
+# ensure_loose_rp_filter [TUN_IFACE] — set reverse-path filtering to "loose" (2) instead
+# of the kernel/Ubuntu default "strict" (1), persisted via its own sysctl drop-in.
+#
+# BUG FIX: this is the most common concrete cause behind "the tunnel connects, but the two
+# servers sometimes can't ping each other" / "it works, then it doesn't". Strict RPF drops
+# an inbound packet whenever the route back out does not go via the interface it arrived
+# on. Adding a tun device is exactly that kind of asymmetry (tun vs. the public NIC), and
+# on cloud VPS hosts with policy routing, multiple NICs, or floating/alias IPs the kernel's
+# route choice for the return path isn't always the same one the packet arrived on — so
+# this drops tunnel and forwarded traffic intermittently, depending on which route the
+# kernel happens to pick at that moment. Previously this was only ever fixed by chance, if
+# the user opted into the optional "network optimization" step; make it unconditional, the
+# same way ensure_sock_buf_ceiling() above was pulled out of that optional step.
+ensure_loose_rp_filter() {
+  local tun="${1:-tun0}"
+  sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
+  mkdir -p /etc/sysctl.d
+  cat > /etc/sysctl.d/97-aestun-rpfilter.conf <<EOF
+# Managed by aestun — loose reverse-path filtering so asymmetric routing between the
+# tunnel interface (${tun}) and the public NIC never causes silent, intermittent
+# packet drops (strict RPF, the kernel default, would drop them instead).
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
 EOF
 }
 
@@ -766,91 +745,53 @@ PY
   chmod 600 "$CONF"
 }
 
-# fwd_prompt_ports_csv — ask for a comma-separated list of ports ONCE (e.g. "1080,443,8080")
-# instead of looping "add one port? y/n" for every single port. Prints "port target_port
-# proto" lines to stdout, one per valid entry (invalid ones are warned about on stderr and
-# skipped, everything else still goes through). Shared by the setup wizard and the menu.
-fwd_prompt_ports_csv() {
-  local src tgt proto
-  src="$(ask_req "Public port(s) on THIS server — comma separated, e.g. 1080,443")" || return 1
-  tgt="$(ask "Target port(s) on the FOREIGN server — comma separated, same order (Enter = same as above)" "")"
-  proto="$(ask "Protocol for all of the above (tcp/udp/both)" "tcp")"
-  case "$proto" in tcp|udp|both) ;; *) warn "  unknown protocol '$proto' — using tcp."; proto="tcp" ;; esac
-
-  local -a sp tp
-  IFS=',' read -ra sp <<< "$(printf '%s' "$src" | tr -d ' ')"
-  if [[ -n "$tgt" ]]; then
-    IFS=',' read -ra tp <<< "$(printf '%s' "$tgt" | tr -d ' ')"
-    if (( ${#tp[@]} != ${#sp[@]} )); then
-      warn "  target port count (${#tp[@]}) doesn't match source count (${#sp[@]}) — using the same ports as targets."
-      tp=("${sp[@]}")
-    fi
+# fwd_prompt_ports_simple [DEFAULT_CSV] — ask ONCE for a comma-separated port list (e.g.
+# "1080,443") and print "port target_port proto" lines to stdout, one per valid entry.
+# Target port is always the same as the public port and protocol is always tcp — this is
+# intentionally a single question with nothing else to answer, as requested. If
+# DEFAULT_CSV is given (the forwards already in config.json), pressing Enter keeps them
+# unchanged and typing "none" clears them, so re-running this never silently wipes an
+# existing list just because the operator pressed Enter without reading closely.
+fwd_prompt_ports_simple() {
+  local def="${1:-}" prompt csv port
+  if [[ -n "$def" ]]; then
+    prompt="Port(s) to forward — comma separated, e.g. 1080,443 (type 'none' to disable)"
   else
-    tp=("${sp[@]}")
+    prompt="Port(s) to forward — comma separated, e.g. 1080,443 (Enter = none)"
   fi
-
-  local i port tport
-  for (( i = 0; i < ${#sp[@]}; i++ )); do
-    port="${sp[$i]}"; tport="${tp[$i]:-$port}"
-    if ! is_port "$port"; then warn "  skipping invalid public port: ${port:-<empty>}"; continue; fi
-    if ! is_port "$tport"; then warn "  skipping invalid target port: ${tport:-<empty>} (for ${port})"; continue; fi
-    if [[ "$proto" == "both" ]]; then
-      printf '%s %s tcp\n' "$port" "$tport"
-      printf '%s %s udp\n' "$port" "$tport"
-    else
-      printf '%s %s %s\n' "$port" "$tport" "$proto"
-    fi
+  csv="$(ask "$prompt" "$def")"
+  [[ -z "$csv" || "$csv" == "none" || "$csv" == "-" ]] && return 0
+  local -a sp; IFS=',' read -ra sp <<< "$(printf '%s' "$csv" | tr -d ' ')"
+  for port in "${sp[@]}"; do
+    [[ -z "$port" ]] && continue
+    if ! is_port "$port"; then warn "  skipping invalid port: $port"; continue; fi
+    printf '%s %s tcp\n' "$port" "$port"
   done
 }
 
 # fwd_wizard_collect — used both during interactive_setup (before the config file exists,
 # so it fills CFG_FWD_JSON) and standalone from the menu (writes straight to config.json).
-#
-# CHANGED (single-pass, no prompts): used to ask "Add port(s) to forward? [y/N]" in a
-# loop, so a Y/N gate had to be answered before AND after every batch of ports. Now it's
-# always asked exactly once — a single comma-separated port list (e.g. "1080,443"),
-# Enter with nothing entered means "no forwarding on this server". No extra questions.
+# Pre-fills the prompt with whatever is already configured, so re-running setup on an
+# existing role-a install defaults to "keep what's there" instead of defaulting to empty.
 fwd_wizard_collect() { # sets CFG_FWD_JSON
-  local items=() port tport proto
-  printf '\n%sPort forwarding%s — expose ports on THIS (Iran) server that get transparently\n' "$BOLD" "$N"
-  printf 'forwarded through the tunnel to the foreign server.\n'
-  printf '%sOnly meaningful on the Iran/role-a side.%s\n' "$D" "$N"
-  local csv; csv="$(ask "Public port(s) to forward — comma separated, e.g. 1080,443 (Enter = none)" "")"
-  if [[ -n "$csv" ]]; then
-    while read -r port tport proto; do
-      [[ -z "$port" ]] && continue
-      items+=("{\"port\":${port},\"target_port\":${tport},\"proto\":\"${proto}\"}")
-      msg "  queued: ${port}/${proto} -> foreign:${tport}"
-    done < <(fwd_ports_csv_to_rows "$csv" "$csv" "tcp")
+  local items=() port tport proto existing_csv=""
+  if [[ -f "$CONF" ]]; then
+    existing_csv="$(fwd_list_from_conf | awk '{printf "%s%s", sep, $1; sep=","}')"
   fi
+  printf '\n%sPort forwarding%s — ports entered here are exposed on THIS (Iran) server and\n' "$BOLD" "$N"
+  printf 'transparently forwarded through the tunnel to the foreign server (same port on\n'
+  printf 'both sides, tcp). Enter them once, comma separated — e.g. 1080,443.\n'
+  printf '%sOnly meaningful on the Iran/role-a side; skipped on the foreign server.%s\n' "$D" "$N"
+  while read -r port tport proto; do
+    [[ -z "$port" ]] && continue
+    items+=("{\"port\":${port},\"target_port\":${tport},\"proto\":\"${proto}\"}")
+    msg "  queued: ${port}/${proto} -> foreign:${tport}"
+  done < <(fwd_prompt_ports_simple "$existing_csv")
   if (( ${#items[@]} == 0 )); then
     CFG_FWD_JSON="[]"
   else
     local IFS=,; CFG_FWD_JSON="[${items[*]}]"
   fi
-}
-
-# fwd_ports_csv_to_rows SRC_CSV TGT_CSV PROTO — same validation/pairing logic as
-# fwd_prompt_ports_csv, factored out so it can be driven from a single already-collected
-# CSV string instead of prompting interactively each time.
-fwd_ports_csv_to_rows() {
-  local src="$1" tgt="$2" proto="${3:-tcp}"
-  case "$proto" in tcp|udp|both) ;; *) proto="tcp" ;; esac
-  local -a sp tp
-  IFS=',' read -ra sp <<< "$(printf '%s' "$src" | tr -d ' ')"
-  IFS=',' read -ra tp <<< "$(printf '%s' "$tgt" | tr -d ' ')"
-  local i port tport
-  for (( i = 0; i < ${#sp[@]}; i++ )); do
-    port="${sp[$i]}"; tport="${tp[$i]:-$port}"
-    if ! is_port "$port"; then warn "  skipping invalid public port: ${port:-<empty>}"; continue; fi
-    if ! is_port "$tport"; then warn "  skipping invalid target port: ${tport:-<empty>} (for ${port})"; continue; fi
-    if [[ "$proto" == "both" ]]; then
-      printf '%s %s tcp\n' "$port" "$tport"
-      printf '%s %s udp\n' "$port" "$tport"
-    else
-      printf '%s %s %s\n' "$port" "$tport" "$proto"
-    fi
-  done
 }
 
 fwd_menu() {
@@ -883,7 +824,7 @@ EOF
           [[ -z "$port" ]] && continue
           fwd_add "$port" "$tport" "$proto"
           n=$(( n + 1 ))
-        done < <(fwd_prompt_ports_csv)
+        done < <(fwd_prompt_ports_simple)
         if (( n > 0 )); then fwd_apply; msg "${n} forward(s) added and applied."
         else err "no valid ports entered."; fi
         pause ;;
@@ -1087,29 +1028,29 @@ interactive_setup() {
 
   # --- port forwarding (the whole point of most single-purpose deployments: expose a
   #     port on the Iran server that is transparently routed to the foreign server) ---
-  # CHANGED: role b (foreign/Kharej) is a pure tunnel endpoint — it is never asked about
-  # port forwarding at all, not even a skip message requiring a read. Role a (Iran) gets
-  # exactly one prompt (inside fwd_wizard_collect), not a y/n loop.
   CFG_FWD_JSON="[]"
   if [[ "$CFG_ROLE" == "a" ]]; then
     fwd_wizard_collect
+  else
+    printf '\n%sPort forwarding is configured from the Iran (role a) server; skipping here.%s\n' "$D" "$N"
   fi
 
   write_config
   ensure_sock_buf_ceiling "${CFG_BUF:-8388608}"
+  ensure_loose_rp_filter "$CFG_TUN"
   write_service
   systemctl daemon-reload
   systemctl enable --now aestun >/dev/null 2>&1 && msg "Service enabled and started."
+  # Self-healing watchdog — installed and enabled automatically, no question asked, on
+  # both roles: it restarts aestun on its own if the tunnel ever goes silently idle.
+  write_watchdog_units
   open_firewall "$CFG_LISTEN_PORT" "$CFG_TRANSPORT"
   if [[ "$CFG_HOP" == true ]]; then
     local p
     for p in ${CFG_HOP_PORTS//,/ }; do open_firewall "$p" "$CFG_TRANSPORT"; done
   fi
-  # CHANGED: port forwarding on the Iran side is now enabled automatically whenever any
-  # forwards were entered — no confirmation question. (Previously this was already
-  # unconditional once CFG_FWD_JSON was non-empty; the y/n gate that used to make
-  # CFG_FWD_JSON non-empty in the first place — "Add port(s) to forward?" — is what was
-  # removed above, in fwd_wizard_collect.)
+  # Make sure IP forwarding is on if any forwards were configured, otherwise DNAT'd
+  # packets get dropped by the kernel before they ever reach POSTROUTING.
   if [[ "$CFG_FWD_JSON" != "[]" ]]; then
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     fwd_apply
@@ -1276,6 +1217,13 @@ diag_report() {
     ok=0
   fi
 
+  local wd_state; wd_state="$(svc_active aestun-watchdog.timer)"
+  if [[ "$wd_state" == "active" ]]; then
+    msg "watchdog: active (auto-restarts the tunnel if it goes quiet)"
+  else
+    warn "watchdog: ${wd_state} — run setup (option 1) once to install it"
+  fi
+
   if ip link show "$tun" >/dev/null 2>&1; then
     if ip link show "$tun" 2>/dev/null | grep -q "state UP\|UNKNOWN"; then
       msg "interface ${tun}: up"
@@ -1305,21 +1253,10 @@ diag_report() {
     else
       err "carrier port ${port}/${transport}: nothing is listening locally"; ok=0
     fi
-    # BUG FIX: this used to only warn, so diag_report could call the tunnel "healthy"
-    # even while the local firewall silently dropped every inbound carrier packet (the
-    # most common cause of "service is active, interface is up, but nothing ever
-    # connects/pings"). It's now part of the pass/fail result, with the fix spelled out
-    # (and fw-rule re-adds this automatically on every service start — see ExecStartPre
-    # in write_service — so this should normally self-heal; seeing it missing here means
-    # something removed it again after the service last started, e.g. a manual `ufw
-    # reload` or `iptables -F` since then).
     if fw_rule_present "$port" "$transport"; then
       msg "local firewall: ${port}/${transport} allowed (iptables)"
     else
-      err "local firewall: no ACCEPT rule for ${port}/${transport} — inbound carrier"
-      err "  packets are likely being dropped locally. Fix: systemctl restart aestun"
-      err "  (fw-rule re-adds it on start), or run directly: ${MGR_DST} fw-rule add"
-      ok=0
+      warn "local firewall: no ACCEPT rule found for ${port}/${transport} yet"
     fi
   fi
 
@@ -1452,9 +1389,6 @@ diag_report() {
     printf '     transport, or the Anti-DPI hardening / zapret menus (options 11 / 14).\n'
     printf '  5. journalctl -u aestun -n 100 — look for auth_fail / handshake errors, which\n'
     printf '     point at a key or cipher mismatch specifically.\n'
-    printf '  6. %sservice was restarted recently on only ONE side?%s After a restart the local\n' "$BOLD" "$N"
-    printf '     firewall rule (fw-rule) and the carrier conntrack state are rebuilt — give the\n'
-    printf '     other side ~10-15s and re-test before assuming something is actually broken.\n'
     return 1
   fi
   printf '\n'; msg "Everything checks out on this side."
@@ -1731,13 +1665,16 @@ uninstall_all() {
   local iface; iface="$(json_get "$CONF" tun_name)"; iface="${iface:-tun0}"
   fwd_rule del 2>/dev/null || true
   systemctl disable --now aestun >/dev/null 2>&1 || true
+  systemctl disable --now aestun-watchdog.timer >/dev/null 2>&1 || true
   zap_rule del 2>/dev/null || true
   systemctl disable --now aestun-zapret >/dev/null 2>&1 || true
-  rm -f "$SERVICE" "$ZAP_SERVICE" "$ZAP_RULES" "$FWD_SERVICE" "$BIN_DST"
+  rm -f "$SERVICE" "$ZAP_SERVICE" "$ZAP_RULES" "$FWD_SERVICE" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$BIN_DST"
   systemctl daemon-reload
   ip link del "$iface" 2>/dev/null || true
   [[ -n "$port" ]] && close_firewall "$port" "$transport"
   remove_network_opt
+  rm -f /etc/sysctl.d/98-aestun-bufmin.conf /etc/sysctl.d/97-aestun-rpfilter.conf
+  sysctl --system >/dev/null 2>&1 || true
   rm -rf "$CONF_DIR"
   rm -rf "$ZAPRET_DIR"
   msg "Everything removed."
@@ -1903,13 +1840,8 @@ c.setdefault("hop",{})["ports"]=ports or [443,8443,2053,2083,2087,2096]
 json.dump(c,open(p,"w"),indent=2)
 PY
   chmod 600 "$CONF"
-  local transport; transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
   local p
-  # BUG FIX: this used to hardcode "udp" regardless of the tunnel's actual configured
-  # transport, so a tcp-transport tunnel with hop ports set from this menu got firewall
-  # rules for the wrong protocol and every hop onto a new port dropped silently. Use
-  # the configured transport, same as interactive_setup already does.
-  for p in ${hp//,/ }; do open_firewall "$p" "$transport"; done
+  for p in ${hp//,/ }; do open_firewall "$p" udp; done
   msg "hop ports set. Open them in the cloud firewall on BOTH servers."
 }
 
@@ -2171,12 +2103,13 @@ PY
 }
 
 status_line() {
-  local st ins peer
+  local st ins peer wd
   st="$(svc_active aestun)"
   ins="not configured"; [[ -f "$CONF" ]] && ins="configured"
   local st_c="$R"; [[ "$st" == active ]] && st_c="$G"
   peer="$(json_get "$CONF" peer 2>/dev/null)"
-  printf '%s\n' "${D}status: ${st_c}${st}${N}${D} | ${ins} | peer: ${peer:-–} | arch: $(arch_tag)${N}"
+  wd="$(svc_active aestun-watchdog.timer)"
+  printf '%s\n' "${D}status: ${st_c}${st}${N}${D} | ${ins} | peer: ${peer:-–} | watchdog: ${wd} | arch: $(arch_tag)${N}"
 }
 
 main_menu() {
@@ -2287,6 +2220,78 @@ zap_rule() {
 }
 
 # =============================================================================
+#  Watchdog — self-heals a silently-wedged tunnel.
+# =============================================================================
+# BUG FIX: the daemon process can stay "active" in systemd while the actual tunnel has
+# stopped passing traffic (a missed rekey, the peer rebooting mid-handshake, a transient
+# route flap, strict RPF dropping a packet at just the wrong moment). The service never
+# crashes, so Restart=always never fires on its own, and the operator only finds out when
+# the two servers can't ping each other and someone restarts it by hand. This is the
+# concrete mechanism behind "sometimes the connection just doesn't come up" reported
+# intermittently. A small timer checks the daemon's own stats periodically and restarts
+# it if no data has arrived from the peer for too long, so it recovers on its own within
+# one check interval instead of waiting on a human to notice and intervene.
+write_watchdog_units() {
+  cat > "$WATCHDOG_SERVICE" <<EOF
+[Unit]
+Description=aestun watchdog - restart the tunnel if it goes silent
+After=aestun.service
+
+[Service]
+Type=oneshot
+ExecStart=${MGR_DST} watchdog-check
+EOF
+
+  cat > "$WATCHDOG_TIMER" <<EOF
+[Unit]
+Description=Run the aestun watchdog periodically
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now aestun-watchdog.timer >/dev/null 2>&1
+}
+
+# watchdog_check — invoked every ~30s by aestun-watchdog.timer (via `aestun-mgr
+# watchdog-check`). Restarts aestun if the service is active but no packet has arrived
+# from the peer for too long. Rate-limited so a genuinely unreachable peer (other server
+# down, provider firewall closed) doesn't get restarted forever every 30s for nothing.
+watchdog_check() {
+  [[ -f "$CONF" && -f "$STATS" ]] || return 0
+  [[ "$(svc_active aestun)" == "active" ]] || return 0
+
+  local ka lastrx nowu age thresh
+  ka="$(json_get "$CONF" keepalive)"; ka="${ka:-25}"
+  lastrx="$(json_get "$STATS" last_rx_unix)"; nowu="$(json_get "$STATS" now_unix)"
+  : "${lastrx:=0}" "${nowu:=0}"
+  # No data yet at all (service just started, or stats not populated) — nothing to judge.
+  [[ "$lastrx" -gt 0 && "$nowu" -gt 0 ]] || return 0
+
+  age=$(( nowu - lastrx ))
+  # Always at least 90s of silence, and at least 3 keepalive intervals of grace, so a
+  # healthy but momentarily quiet link is never restarted for nothing.
+  thresh=$(( ka * 3 )); (( thresh < 90 )) && thresh=90
+  (( age < thresh )) && return 0
+
+  mkdir -p "$(dirname "$WATCHDOG_STATE")"
+  local last_restart=0
+  [[ -f "$WATCHDOG_STATE" ]] && last_restart="$(cat "$WATCHDOG_STATE" 2>/dev/null || echo 0)"
+  # Never restart more than once every 2 minutes, so a peer that is simply down or
+  # unreachable doesn't flap the service forever.
+  (( nowu - last_restart < 120 )) && return 0
+
+  logger -t aestun-watchdog "no data from peer for ${age}s (>${thresh}s) — restarting aestun" 2>/dev/null || true
+  echo "$nowu" > "$WATCHDOG_STATE"
+  systemctl restart aestun >/dev/null 2>&1
+}
+
+# =============================================================================
 #  build — cross-compile a static Linux binary (dev machine with Go).
 #    ./aestun.sh build [arch] [obfuscate]
 #
@@ -2357,6 +2362,8 @@ do_upgrade() {
   # without requiring a full reinstall.
   write_service
   systemctl daemon-reload
+  ensure_loose_rp_filter "$(json_get "$CONF" tun_name)"
+  write_watchdog_units
 
   # --- cipher ---
   local cur rec hw cpuname
@@ -2434,7 +2441,7 @@ BANNER
 case "${1:-menu}" in
   zap-rule) shift; zap_rule "$@"; exit $? ;;   # systemd path — no menu, no root prompt
   fwd-rule) shift; fwd_rule "$@"; exit $? ;;   # systemd path — no menu, no root prompt
-  fw-rule)  shift; fw_rule "$@"; exit $? ;;    # systemd path — no menu, no root prompt
+  watchdog-check) shift; watchdog_check "$@"; exit $? ;;   # systemd timer path — no menu, no root prompt
   fetch-core) fetch_core; exit $? ;;           # download Go source + prebuilt binaries from upstream
   build)    shift; do_build "$@"; exit $? ;;
   dpi-report) shift; "$BIN_DST" dpi-report -config "$CONF" "$@"; exit $? ;;
@@ -2454,7 +2461,6 @@ first run, then installer + manager + monitor + zapret + build + port-forward.
   ./aestun.sh dpi-report        summarise the DPI/probe log
   ./aestun.sh zap-rule VERB     NFQUEUE helper {add|del|rearm}, invoked by systemd
   ./aestun.sh fwd-rule VERB     Port-forward DNAT helper {add|del}, invoked by systemd
-  ./aestun.sh fw-rule VERB      Local firewall ACCEPT helper {add|del}, invoked by systemd
   ./aestun.sh fetch-core        download Go source + prebuilt binaries from upstream
 
 Setup no longer asks for the shared key (PSK) or the tunnel port — it reuses an
@@ -2463,7 +2469,13 @@ without editing the file:
   AESTUN_PSK="$(head -c32 /dev/urandom | base64)" AESTUN_PORT=2087 sudo -E ./aestun.sh install
 (sudo drops the environment unless you pass -E.) See the DEFAULT_PSK/DEFAULT_PORT
 comment near the top of this file for the security note about the built-in PSK.
+
+On the Iran (role a) server, port forwarding is one question: a comma-separated
+port list (e.g. 1080,443), same port on both ends over tcp, applied automatically
+at the end of setup — nothing further asked. It's skipped entirely on the foreign
+(role b) server. A watchdog timer (aestun-watchdog) is installed on both servers
+automatically and restarts the tunnel on its own if it ever goes silently idle.
 USAGE
     exit 0 ;;
-  *) err "unknown command: $1  (try: install | menu | zap-rule | fwd-rule | fw-rule | fetch-core | build)"; exit 1 ;;
+  *) err "unknown command: $1  (try: install | menu | zap-rule | fwd-rule | fetch-core | build)"; exit 1 ;;
 esac
