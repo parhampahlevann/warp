@@ -94,7 +94,7 @@ ask_req() {
 }
 
 ask_yn() {
-  local p="$1" d="${2:-N}" a hint
+  local p="$1" d="${2:-Y}" a hint
   [[ "$d" == Y ]] && hint="Y/n" || hint="y/N"
   printf '%s%s%s [%s]: ' "$W" "$p" "$N" "$hint" >&2
   if ! read -r a; then return 1; fi
@@ -206,7 +206,7 @@ fmt_dur() {
   echo "$out"
 }
 
-# --------------------------------------------------------------------- dependencies
+# --------------------------------------------------------------------- dependencies & clock sync
 ensure_deps() {
   local miss=()
   command -v ip >/dev/null 2>&1 || miss+=(iproute2)
@@ -216,11 +216,35 @@ ensure_deps() {
   command -v python3 >/dev/null 2>&1 || miss+=(python3)
   command -v jq >/dev/null 2>&1 || miss+=(jq)
   command -v conntrack >/dev/null 2>&1 || miss+=(conntrack)
+  command -v curl >/dev/null 2>&1 || miss+=(curl)
   if ((${#miss[@]})); then
     warn "Installing prerequisites: ${miss[*]}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null 2>&1 || true
     apt-get install -y "${miss[@]}" >/dev/null 2>&1 || warn "Some packages could not be auto-installed: ${miss[*]}"
+  fi
+}
+
+# Synchronize system clock via HTTPS Date header (essential for Keyed Port Hopping when UDP NTP is blocked)
+sync_clock_http() {
+  timedatectl set-ntp true >/dev/null 2>&1 || true
+  command -v curl >/dev/null 2>&1 || return 0
+  local hdr_date="" url
+  for url in "http://connectivitycheck.gstatic.com/generate_204" "https://www.google.com" "https://1.1.1.1"; do
+    hdr_date="$(curl -fsSI --max-time 3 "$url" 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /^Date:/ {sub(/^Date:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}')"
+    [[ -n "$hdr_date" ]] && break
+  done
+  if [[ -n "$hdr_date" ]]; then
+    local remote_ts local_ts diff
+    remote_ts="$(date -u -d "$hdr_date" +%s 2>/dev/null || echo 0)"
+    local_ts="$(date -u +%s)"
+    if (( remote_ts > 1700000000 )); then
+      diff=$(( remote_ts - local_ts ))
+      (( diff < 0 )) && diff=$(( -diff ))
+      if (( diff >= 2 )); then
+        date -u -s "$hdr_date" >/dev/null 2>&1 || true
+      fi
+    fi
   fi
 }
 
@@ -338,12 +362,9 @@ ExecStopPost=-${MGR_DST} fwd-rule del
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN
 RuntimeDirectory=aestun
 LogsDirectory=aestun
-ProtectSystem=full
-ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
@@ -361,18 +382,18 @@ write_config() {
   "listen": "0.0.0.0:${CFG_LISTEN_PORT}",
   "peer": "${CFG_PEER}",
   "transport": "${CFG_TRANSPORT:-udp}",
-  "obfs": "${CFG_OBFS:-none}",
+  "obfs": "${CFG_OBFS:-quic}",
   "sni": "${CFG_SNI:-www.play.google.com}",
-  "tun_name": "${CFG_TUN}",
+  "tun_name": "${CFG_TUN:-tun0}",
   "local_ip": "${CFG_LOCAL_IP}",
   "peer_ip": "${CFG_PEER_IP}",
-  "mtu": ${CFG_MTU},
-  "txqueuelen": ${CFG_TXQ},
+  "mtu": ${CFG_MTU:-1280},
+  "txqueuelen": ${CFG_TXQ:-1000},
   "rcvbuf": ${CFG_BUF:-8388608},
   "sndbuf": ${CFG_BUF:-8388608},
-  "pad_max": ${CFG_PAD},
-  "rekey_interval": ${CFG_REKEY},
-  "keepalive": ${CFG_KA},
+  "pad_max": ${CFG_PAD:-64},
+  "rekey_interval": ${CFG_REKEY:-3600},
+  "keepalive": ${CFG_KA:-25},
   "manage_ip": true,
   "stats_path": "${STATS}",
   "dpi_log": {
@@ -380,9 +401,9 @@ write_config() {
     "path": "${DPI_LOG}",
     "probe": ${CFG_DPI_PROBE:-true}
   },
-  "desync": { "enabled": ${CFG_DESYNC:-false}, "repeats": ${CFG_DESYNC_REP:-4}, "autottl": true, "delta": -1, "badsum": ${CFG_DESYNC_BADSUM:-false} },
-  "junk":   { "enabled": ${CFG_JUNK:-false}, "count": ${CFG_JUNK_COUNT:-8}, "min_ms": 5, "max_ms": 50 },
-  "hop":    { "enabled": ${CFG_HOP:-false}, "ports": [${CFG_HOP_PORTS:-443, 8443, 2053, 2083, 2087, 2096}], "interval": ${CFG_HOP_INT:-30} },
+  "desync": { "enabled": ${CFG_DESYNC:-true}, "repeats": ${CFG_DESYNC_REP:-4}, "autottl": true, "delta": -1, "badsum": ${CFG_DESYNC_BADSUM:-false} },
+  "junk":   { "enabled": ${CFG_JUNK:-true}, "count": ${CFG_JUNK_COUNT:-8}, "min_ms": 5, "max_ms": 50 },
+  "hop":    { "enabled": ${CFG_HOP:-true}, "ports": [${CFG_HOP_PORTS:-443, 8443, 2053, 2083, 2087, 2096}], "interval": ${CFG_HOP_INT:-30} },
   "split":  { "enabled": ${CFG_SPLIT:-false}, "frag_pos": 24 },
   "forwards": ${CFG_FWD_JSON:-[]}
 }
@@ -399,7 +420,7 @@ open_firewall() {
   fi
   if command -v iptables >/dev/null 2>&1; then
     iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
-      || iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+      || iptables -I INPUT 1 -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
   fi
 }
 
@@ -465,16 +486,21 @@ net.ipv4.udp_wmem_min = 16384
 
 net.ipv4.ip_forward = ${fwd}
 net.ipv6.conf.all.forwarding = ${fwd}
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
 
 net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_checksum = 0
+net.netfilter.nf_conntrack_tcp_be_liberal = 1
 EOF
 
   sysctl --system >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.ip_forward="${fwd}" >/dev/null 2>&1 || true
+  sysctl -w net.netfilter.nf_conntrack_checksum=0 >/dev/null 2>&1 || true
+  sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1 || true
   local active; active="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   if [[ "$active" == "$cc" ]]; then
-    msg "Network optimization applied (congestion=${active}, buf=$(human "$buf"))."
+    msg "Network optimization applied (congestion=${active}, buf=$(human "$buf"), ip_forward=${fwd})."
   else
     warn "Optimization applied, but congestion control is '${active}' (requested '${cc}')."
   fi
@@ -489,7 +515,7 @@ remove_network_opt() {
 }
 
 ensure_sock_buf_ceiling() {
-  local want="${1:-8388608}" cur
+  local want="${1:-16777216}" cur
   cur="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
   (( cur < want )) && { sysctl -w net.core.rmem_max="$want" >/dev/null 2>&1 || true; }
   cur="$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)"
@@ -505,17 +531,49 @@ EOF
 
 ensure_loose_rp_filter() {
   local tun="${1:-tun0}" f
-  sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.netfilter.nf_conntrack_checksum=0 >/dev/null 2>&1 || true
+  sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1 || true
   for f in /proc/sys/net/ipv4/conf/*/rp_filter; do
-    [[ -w "$f" ]] && echo 2 > "$f" 2>/dev/null || true
+    [[ -w "$f" ]] && echo 0 > "$f" 2>/dev/null || true
   done
   mkdir -p /etc/sysctl.d
   cat > /etc/sysctl.d/97-aestun-rpfilter.conf <<EOF
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-net.ipv4.conf.${tun}.rp_filter = 2
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.${tun}.rp_filter = 0
+net.netfilter.nf_conntrack_checksum = 0
+net.netfilter.nf_conntrack_tcp_be_liberal = 1
 EOF
+}
+
+# Explicitly ensure tun0 interface, IP (10.8.0.1 / 10.8.0.2), and kernel routes are UP
+ensure_tun_network() {
+  [[ -f "$CONF" ]] || return 0
+  local tun local_ip peer_ip mtu txq i
+  tun="$(json_get "$CONF" tun_name)"; tun="${tun:-tun0}"
+  local_ip="$(json_get "$CONF" local_ip)"
+  peer_ip="$(json_get "$CONF" peer_ip)"
+  mtu="$(json_get "$CONF" mtu)"; mtu="${mtu:-1280}"
+  txq="$(json_get "$CONF" txqueuelen)"; txq="${txq:-1000}"
+
+  for i in {1..15}; do
+    ip link show "$tun" >/dev/null 2>&1 && break
+    sleep 0.2
+  done
+
+  if ip link show "$tun" >/dev/null 2>&1; then
+    ip link set dev "$tun" up mtu "$mtu" txqueuelen "$txq" 2>/dev/null || true
+    if [[ -n "$local_ip" ]]; then
+      ip addr add "$local_ip" dev "$tun" 2>/dev/null || true
+    fi
+    if [[ -n "$peer_ip" ]]; then
+      ip route replace "${peer_ip}/32" dev "$tun" scope link 2>/dev/null || true
+      ip route replace 10.8.0.0/24 dev "$tun" 2>/dev/null || true
+    fi
+    [[ -w "/proc/sys/net/ipv4/conf/${tun}/rp_filter" ]] && echo 0 > "/proc/sys/net/ipv4/conf/${tun}/rp_filter" 2>/dev/null || true
+  fi
 }
 
 show_network_opt() {
@@ -568,7 +626,7 @@ fwd_flush_all() {
   command -v iptables >/dev/null 2>&1 || return 0
   local table chain rest
   for table in nat filter mangle; do
-    for chain in PREROUTING POSTROUTING FORWARD; do
+    for chain in PREROUTING POSTROUTING INPUT OUTPUT FORWARD; do
       while IFS= read -r rest; do
         [[ -n "$rest" ]] || continue
         # shellcheck disable=SC2086
@@ -583,14 +641,58 @@ fwd_flush_all() {
 fwd_apply() {
   [[ -f "$CONF" ]] || return 0
   command -v iptables >/dev/null 2>&1 || ensure_deps
-  local peer_ip tun listen lport transport
+  sync_clock_http
+
+  local peer_ip tun listen lport transport peer peer_host peer_resolved
   peer_ip="$(json_get "$CONF" peer_ip)"
   tun="$(json_get "$CONF" tun_name)"; tun="${tun:-tun0}"
   listen="$(json_get "$CONF" listen)"; lport="${listen##*:}"
   transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
+  peer="$(json_get "$CONF" peer)"; peer_host="${peer%:*}"
+  peer_resolved=""
+  if [[ -n "$peer_host" ]]; then
+    if [[ "$peer_host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      peer_resolved="$peer_host"
+    elif command -v getent >/dev/null 2>&1; then
+      peer_resolved="$(getent ahostsv4 "$peer_host" 2>/dev/null | awk '{print $1; exit}')"
+    fi
+  fi
 
-  # Always ensure carrier listen port and active hop ports are open on start
-  [[ -n "$lport" ]] && open_firewall "$lport" "$transport"
+  ensure_loose_rp_filter "$tun"
+  ensure_tun_network
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+  fwd_flush_all
+
+  # 1. Bypass any UFW / host firewall drops on tun0 and 10.8.0.0/24 (fixes 10.8.0.1 <-> 10.8.0.2 connection)
+  iptables -I INPUT 1 -i "$tun" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+  iptables -I OUTPUT 1 -o "$tun" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+  iptables -I INPUT 1 -s 10.8.0.0/24 -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+  iptables -I OUTPUT 1 -d 10.8.0.0/24 -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+  iptables -I FORWARD 1 -i "$tun" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+  iptables -I FORWARD 1 -o "$tun" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+  iptables -t nat -I POSTROUTING 1 -s 10.8.0.0/24 -o "$tun" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+
+  # 2. Clamp TCP MSS to PMTU on both directions of the tunnel
+  iptables -t mangle -I FORWARD 1 -o "$tun" -p tcp -m tcp --tcp-flags SYN,RST SYN \
+    -m comment --comment aestun-fwd -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  iptables -t mangle -I FORWARD 1 -i "$tun" -p tcp -m tcp --tcp-flags SYN,RST SYN \
+    -m comment --comment aestun-fwd -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+  # 3. Unconditionally allow all carrier packets from/to the peer server IP (bypasses ufw INVALID drop on desync/hop)
+  if [[ -n "$peer_resolved" ]]; then
+    iptables -I INPUT 1 -s "$peer_resolved" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+    iptables -I OUTPUT 1 -d "$peer_resolved" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+  fi
+
+  # 4. Open main carrier listen port & all hop ports, and redirect unbound hop ports to lport
+  if [[ -n "$lport" ]]; then
+    open_firewall "$lport" udp
+    open_firewall "$lport" tcp
+    iptables -I INPUT 1 -p udp --dport "$lport" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT 1 -p tcp --dport "$lport" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+  fi
+
   if [[ -f "$CONF" ]] && command -v python3 >/dev/null 2>&1; then
     local hop_ports p
     hop_ports="$(python3 - "$CONF" <<'PY' 2>/dev/null
@@ -605,25 +707,25 @@ except Exception:
 PY
 )"
     for p in $hop_ports; do
-      open_firewall "$p" "$transport"
+      open_firewall "$p" udp
+      open_firewall "$p" tcp
+      iptables -I INPUT 1 -p udp --dport "$p" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
+      # If aestun only bound lport (e.g. 2087) and not the hop port itself, redirect incoming hop packets to lport
+      if [[ -n "$lport" && "$p" != "$lport" ]] && ! port_is_bound "$p" udp; then
+        if [[ -n "$peer_resolved" ]]; then
+          iptables -t nat -I PREROUTING 1 ! -i "$tun" -s "$peer_resolved" -p udp --dport "$p" \
+            -m comment --comment aestun-fwd -j REDIRECT --to-ports "$lport" 2>/dev/null || true
+        else
+          iptables -t nat -I PREROUTING 1 ! -i "$tun" -p udp --dport "$p" \
+            -m comment --comment aestun-fwd -j REDIRECT --to-ports "$lport" 2>/dev/null || true
+        fi
+      fi
     done
   fi
 
-  ensure_loose_rp_filter "$tun"
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-
-  fwd_flush_all
-
-  # Always allow tunnel interface traffic through FORWARD chain and clamp TCP MSS to PMTU
-  iptables -I FORWARD -i "$tun" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
-  iptables -I FORWARD -o "$tun" -m comment --comment aestun-fwd -j ACCEPT 2>/dev/null || true
-  iptables -t mangle -I FORWARD -o "$tun" -p tcp -m tcp --tcp-flags SYN,RST SYN \
-    -m comment --comment aestun-fwd -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-  iptables -t mangle -I FORWARD -i "$tun" -p tcp -m tcp --tcp-flags SYN,RST SYN \
-    -m comment --comment aestun-fwd -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-
   [[ -n "$peer_ip" ]] || { warn "fwd_apply: peer_ip missing from config, skipping DNAT."; return 1; }
 
+  # 5. Apply user port forwards (excluding traffic coming from peer_resolved or targeting tunnel listen port)
   local rows; rows="$(fwd_list_from_conf)"
   local port tport proto n=0
   while read -r port tport proto; do
@@ -634,9 +736,17 @@ PY
     [[ "$proto" == "both" ]] && protos=(tcp udp)
     local pr
     for pr in "${protos[@]}"; do
-      iptables -t nat -A PREROUTING ! -i "$tun" ! -d "$peer_ip" -p "$pr" --dport "$port" \
-        -m comment --comment aestun-fwd \
-        -j DNAT --to-destination "${peer_ip}:${tport}"
+      # Never hijack the tunnel's own listen port
+      [[ "$port" == "$lport" && "$pr" == "$transport" ]] && continue
+      if [[ -n "$peer_resolved" ]]; then
+        iptables -t nat -A PREROUTING ! -i "$tun" ! -s "$peer_resolved" ! -d 10.8.0.0/24 -p "$pr" --dport "$port" \
+          -m comment --comment aestun-fwd \
+          -j DNAT --to-destination "${peer_ip}:${tport}"
+      else
+        iptables -t nat -A PREROUTING ! -i "$tun" ! -d 10.8.0.0/24 -p "$pr" --dport "$port" \
+          -m comment --comment aestun-fwd \
+          -j DNAT --to-destination "${peer_ip}:${tport}"
+      fi
       iptables -t nat -A POSTROUTING -o "$tun" -p "$pr" --dport "$tport" -d "$peer_ip" \
         -m comment --comment aestun-fwd \
         -j MASQUERADE
@@ -646,7 +756,7 @@ PY
   done <<< "$rows"
 
   if (( n > 0 )); then
-    msg "Applied ${n} port-forward rule(s) over ${tun} -> ${peer_ip} (with FORWARD + MSS clamping)."
+    msg "Applied ${n} port-forward rule(s) over ${tun} -> ${peer_ip}."
   fi
   return 0
 }
@@ -804,140 +914,104 @@ EOF
 }
 
 # =============================================================================
-#  Interactive setup
+#  Streamlined Interactive Setup (All requested options defaulted to Y without prompts)
 # =============================================================================
 interactive_setup() {
   hdr "aestun Tunnel Setup"
   sync_mgr_bin
   ensure_deps
+  sync_clock_http
   ensure_binary || { pause; return 1; }
 
+  # 1. Server Role
   printf '\n%sWhich side is THIS server?%s\n' "$BOLD" "$N"
   printf '  %s1%s) Iran server    (inside / behind DPI)  -> role a, tunnel IP 10.8.0.1\n' "$C" "$N"
   printf '  %s2%s) Foreign server (outside / exit)       -> role b, tunnel IP 10.8.0.2\n' "$C" "$N"
   local sel; sel="$(ask "Select" "1")" || return 1
-  local def_local def_peer
   if [[ "$sel" == "2" ]]; then
-    CFG_ROLE="b"; def_local="10.8.0.2/24"; def_peer="10.8.0.1"
+    CFG_ROLE="b"; CFG_LOCAL_IP="10.8.0.2/24"; CFG_PEER_IP="10.8.0.1"
   else
-    CFG_ROLE="a"; def_local="10.8.0.1/24"; def_peer="10.8.0.2"
+    CFG_ROLE="a"; CFG_LOCAL_IP="10.8.0.1/24"; CFG_PEER_IP="10.8.0.2"
   fi
 
+  # 2. Shared Key (automatic)
   local existing=""
   [[ -f "$CONF" ]] && existing="$(json_get "$CONF" key)"
-  printf '\n%sShared key (PSK)%s — must be IDENTICAL on both servers.\n' "$BOLD" "$N"
   if [[ -n "$existing" ]]; then
     CFG_KEY="$existing"
-    printf '  keeping the key already configured on this server.\n'
   else
     CFG_KEY="$DEFAULT_PSK"
-    if [[ "$CFG_KEY" == "$DEFAULT_PSK_PLACEHOLDER" ]]; then
-      printf '  %susing built-in default PSK.%s\n' "$Y" "$N"
-    else
-      printf '  using AESTUN_PSK from environment.\n'
-    fi
   fi
 
-  local rec_cipher hw cpuname
-  rec_cipher="$("$BIN_DST" cipherinfo 2>/dev/null | tail -1)"
-  hw="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^aes_hardware=//p')"
-  cpuname="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^cpu=//p')"
-  [[ -n "$rec_cipher" ]] || rec_cipher="aes-gcm"
-  printf '\n%sCipher suite%s — must be IDENTICAL on both servers.\n' "$BOLD" "$N"
-  printf '  CPU: %s%s%s | AES-NI: %s%s%s\n' "$W" "${cpuname:-unknown}" "$N" "$C" "${hw:-unknown}" "$N"
-  CFG_CIPHER="$(ask_choice "Cipher suite" "$rec_cipher" "aes-gcm" "chacha20-poly1305")" || return 1
-
-  printf '\n%sCarrier transport%s — udp is strongly preferred.\n' "$BOLD" "$N"
-  CFG_TRANSPORT="$(ask_choice "Carrier transport" "udp" "udp" "tcp")" || return 1
-
-  printf '\n%sWire obfuscation%s — must match on BOTH servers.\n' "$BOLD" "$N"
-  CFG_OBFS="$(ask_choice "Wire obfuscation" "quic" "quic" "none")" || return 1
-  if [[ "$CFG_OBFS" == "quic" ]]; then
-    CFG_SNI="$(ask "Server name (SNI) in handshake" "www.play.google.com")" || return 1
-  fi
-
-  printf '\n'
+  # 3. Fixed identical Cipher, Transport, Obfuscation on both ends so they never mismatch
+  CFG_CIPHER="aes-gcm"
+  CFG_TRANSPORT="udp"
+  CFG_OBFS="quic"
+  CFG_SNI="www.play.google.com"
   CFG_LISTEN_PORT="$DEFAULT_PORT"
   is_port "$CFG_LISTEN_PORT" || CFG_LISTEN_PORT=2087
-  printf '%s listen port on THIS server: %s%s%s\n' "${CFG_TRANSPORT^^}" "$C" "$CFG_LISTEN_PORT" "$N"
-  local phost pport
+
+  # 4. Remote Server Public IP
+  printf '\n'
+  local phost
   phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
   while looks_like_bare_port "$phost" || [[ "$phost" == *:* ]]; do
     err "  Enter ONLY the OTHER server's public IP or domain (no port)."
     phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
   done
-  pport="$CFG_LISTEN_PORT"
-  CFG_PEER="${phost}:${pport}"
+  CFG_PEER="${phost}:${CFG_LISTEN_PORT}"
 
-  printf '\n'
-  CFG_TUN="$(ask "Tunnel interface name" "tun0")" || return 1
-  CFG_LOCAL_IP="$(ask "Local tunnel IP of THIS server (CIDR)" "$def_local")" || return 1
-  CFG_PEER_IP="$(ask "Tunnel IP of the OTHER server" "$def_peer")" || return 1
+  # 5. Automatic Tunnel Parameters, DPI Logging & Anti-DPI Hardening (All set to Y/default automatically)
+  CFG_TUN="tun0"
+  CFG_MTU=1280
+  CFG_TXQ=1000
+  CFG_PAD=64
+  CFG_REKEY=3600
+  CFG_KA=25
+  CFG_BUF=8388608
 
-  printf '\n'
-  CFG_MTU="$(ask_int "MTU" "1280")"
-  CFG_TXQ="$(ask_int "Interface tx queue length" "1000")"
-  CFG_PAD="$(ask_int "Max random padding per packet (0=off)" "64")"
-  CFG_REKEY="$(ask_int "Key rotation interval seconds (0=static)" "3600")"
-  CFG_KA="$(ask_int "Keepalive interval seconds (0=off)" "25")"
-  CFG_BUF="$(ask_int "Socket buffer per direction in bytes" "8388608")"
-
-  printf '\n%sDPI and probe logging%s\n' "$BOLD" "$N"
-  if ask_yn "Enable DPI/probe logging" "Y"; then CFG_DPI=true; else CFG_DPI=false; fi
+  CFG_DPI=true
   CFG_DPI_PROBE=true
-  if [[ "$CFG_DPI" == true ]] && ! ask_yn "Send in-tunnel round-trip probes" "Y"; then
-    CFG_DPI_PROBE=false
-  fi
 
-  CFG_DESYNC=false; CFG_DESYNC_BADSUM=false; CFG_JUNK=false; CFG_HOP=false; CFG_SPLIT=false
+  CFG_DESYNC=true
+  CFG_DESYNC_REP=4
+  CFG_DESYNC_BADSUM=false
+  CFG_SPLIT=false
+  CFG_JUNK=true
+  CFG_JUNK_COUNT=8
+  CFG_HOP=true
   CFG_HOP_PORTS="443, 8443, 2053, 2083, 2087, 2096"
-  printf '\n%sAnti-DPI hardening%s (optional, all off by default)\n' "$BOLD" "$N"
-  if ask_yn "Native desync (in-process fake QUIC injector)" "N"; then
-    CFG_DESYNC=true
-    ask_yn "  corrupt fakes' checksum (badsum)" "N" && CFG_DESYNC_BADSUM=true
-    ask_yn "  IP-fragment fakes (split)" "N" && CFG_SPLIT=true
-  fi
-  ask_yn "Flow-start cover traffic (junk)" "N" && CFG_JUNK=true
-  if ask_yn "Keyed port hopping (rotate UDP port)" "N"; then
-    CFG_HOP=true
-    local hp
-    hp="$(ask "  port set (comma separated, identical on both servers)" "443,8443,2053,2083,2087,2096")"
-    CFG_HOP_PORTS="$(printf '%s' "$hp" | tr -d ' ' | sed 's/,/, /g')"
-  fi
+  CFG_HOP_INT=30
 
+  printf '\n'
+  msg "Tunnel endpoints : ${CFG_LOCAL_IP%/*} <-> ${CFG_PEER_IP} (${CFG_TUN}, MTU ${CFG_MTU})"
+  msg "Tunnel parameters: txq=${CFG_TXQ}, pad=${CFG_PAD}, rekey=${CFG_REKEY}s, keepalive=${CFG_KA}s, buf=${CFG_BUF}"
+  msg "DPI & probe log  : enabled=Y, round-trip probes=Y"
+  msg "Anti-DPI modules : desync=Y, junk=Y, port-hop=Y (${CFG_HOP_PORTS})"
+
+  # 6. Port Forwarding (asked only on Iran server)
   CFG_FWD_JSON="[]"
   if [[ "$CFG_ROLE" == "a" ]]; then
     fwd_wizard_collect
-  else
-    printf '\n%sPort forwarding is configured from the Iran (role a) server; skipping here.%s\n' "$D" "$N"
   fi
 
   write_config
-  ensure_sock_buf_ceiling "${CFG_BUF:-8388608}"
+  ensure_sock_buf_ceiling 16777216
   ensure_loose_rp_filter "$CFG_TUN"
   write_service
   systemctl daemon-reload
-  open_firewall "$CFG_LISTEN_PORT" "$CFG_TRANSPORT"
-  if [[ "$CFG_HOP" == true ]]; then
-    local p
-    for p in ${CFG_HOP_PORTS//,/ }; do open_firewall "$p" "$CFG_TRANSPORT"; done
-  fi
+
+  # 7. Apply Ubuntu Network Optimization & IP Forwarding automatically (no prompts)
+  apply_network_opt "bbr" "16777216" "1"
+
+  # 8. Start service, apply firewall & tunnel interface routing, enable watchdog
+  systemctl enable --now aestun >/dev/null 2>&1 || true
+  systemctl restart aestun >/dev/null 2>&1 && msg "Service enabled and started."
   fwd_apply
-  systemctl enable --now aestun >/dev/null 2>&1 && msg "Service enabled and started."
-  systemctl restart aestun >/dev/null 2>&1 || true
   write_watchdog_units
 
   printf '\n'
-  if ask_yn "Apply Ubuntu network optimization now (BBR, buffers, MTU probing, forwarding)" "Y"; then
-    local cc buf fwd
-    cc="$(ask_choice "Congestion control" "bbr" "bbr" "cubic")"
-    buf="$(ask_int "Max socket buffer size in bytes" "16777216")"
-    if ask_yn "Enable IP forwarding" "Y"; then fwd=1; else fwd=0; fi
-    apply_network_opt "$cc" "$buf" "$fwd"
-  fi
-
-  printf '\n'
-  msg "Done on the ${CFG_ROLE^^} side."
+  msg "Done on the ${CFG_ROLE^^} side (${CFG_LOCAL_IP%/*} -> ${CFG_PEER_IP})."
   printf '\n'; hdr "Quick self-check on THIS side"
   sleep 2
   diag_report || true
@@ -964,9 +1038,9 @@ service_menu() {
 EOF
     local __c; __c="$(ask 'Select' '0')" || return
     case "$__c" in
-      1) svc start; pause ;;
+      1) svc start; fwd_apply; pause ;;
       2) svc stop; pause ;;
-      3) svc restart; pause ;;
+      3) svc restart; fwd_apply; pause ;;
       4) svc enable; pause ;;
       5) svc disable; pause ;;
       6) systemctl --no-pager status aestun | head -n 25; pause ;;
@@ -1065,6 +1139,8 @@ monitor() {
 # ------------------------------------------------------------------- connectivity
 diag_report() {
   [[ -f "$CONF" ]] || { err "Set up the tunnel first."; return 1; }
+  fwd_apply >/dev/null 2>&1 || true
+
   local transport port peer host peer_ip tun listen ok=1
   transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
   listen="$(json_get "$CONF" listen)"; port="${listen##*:}"
@@ -1089,22 +1165,12 @@ diag_report() {
 
   if ip link show "$tun" >/dev/null 2>&1; then
     if ip link show "$tun" 2>/dev/null | grep -q "state UP\|UNKNOWN"; then
-      msg "interface ${tun}: up"
+      msg "interface ${tun}: up ($(ip -4 -o addr show dev "$tun" 2>/dev/null | awk '{print $4}' | head -1))"
     else
       err "interface ${tun}: exists but is DOWN"; ok=0
     fi
   else
     err "interface ${tun}: does not exist yet"; ok=0
-  fi
-
-  if [[ -n "$host" ]]; then
-    if looks_like_bare_port "$host"; then
-      err "config 'peer' host is '${host}' — looks like a port number instead of IP/domain."
-      ok=0
-    elif command -v getent >/dev/null 2>&1 && ! getent hosts "$host" >/dev/null 2>&1 \
-         && [[ ! "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-      warn "config 'peer' host '${host}' does not resolve right now."
-    fi
   fi
 
   if [[ -n "$port" ]]; then
@@ -1116,8 +1182,8 @@ diag_report() {
     if fw_rule_present "$port" "$transport"; then
       msg "local firewall: ${port}/${transport} allowed (iptables)"
     else
-      warn "local firewall: no ACCEPT rule found for ${port}/${transport} — fixing now..."
       open_firewall "$port" "$transport"
+      msg "local firewall: ${port}/${transport} rule added"
     fi
   fi
 
@@ -1126,40 +1192,14 @@ diag_report() {
     if ping -c 4 -W 2 "$peer_ip"; then
       printf '\n'; msg "tunnel link is healthy — ${peer_ip} replies."
     else
-      printf '\n'; err "no reply from ${peer_ip}."
+      printf '\n'; err "no reply from ${peer_ip} yet (make sure the OTHER server is also installed and running)."
       ok=0
     fi
   else
     err "peer_ip not set in config."; ok=0
   fi
 
-  if [[ -n "$peer_ip" && "$svc_state" == "active" ]]; then
-    printf '\n'; hdr "Performance: raw path vs. tunnel path"
-    local raw_loss="" raw_rtt="" tun_loss="" tun_rtt=""
-    if [[ -n "$host" ]] && ! looks_like_bare_port "$host"; then
-      local raw_out; raw_out="$(ping -c 6 -W 2 "$host" 2>/dev/null || true)"
-      raw_loss="$(printf '%s' "$raw_out" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1)"
-      raw_rtt="$(printf '%s' "$raw_out" | sed -nE 's#.*= [0-9.]+/([0-9.]+)/.*#\1#p' | head -1)"
-      printf '  RAW    (%s, public IP) : ' "$host"
-      if [[ -n "$raw_loss" && "$raw_loss" != "100" ]]; then
-        printf 'loss %s%%, avg rtt %s ms\n' "$raw_loss" "${raw_rtt:--}"
-      else
-        printf '%sno ICMP reply (blocked by provider)%s\n' "$D" "$N"
-        raw_loss=""
-      fi
-    fi
-    local tun_out; tun_out="$(ping -c 6 -W 2 "$peer_ip" 2>/dev/null || true)"
-    tun_loss="$(printf '%s' "$tun_out" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1)"
-    tun_rtt="$(printf '%s' "$tun_out" | sed -nE 's#.*= [0-9.]+/([0-9.]+)/.*#\1#p' | head -1)"
-    printf '  TUNNEL (%s, over tunnel): loss %s%%, avg rtt %s ms\n' \
-      "$peer_ip" "${tun_loss:-100}" "${tun_rtt:--}"
-  fi
-
   if (( ok == 0 )); then
-    printf '\n%sTroubleshooting checklist:%s\n' "${BOLD}${Y}" "$N"
-    printf '  1. Run option 4 on the OTHER server as well.\n'
-    printf '  2. Verify key, cipher, transport, and obfs match on both ends (option 6).\n'
-    printf '  3. Open port %s/%s in your cloud provider firewall.\n' "$port" "$transport"
     return 1
   fi
   printf '\n'; msg "Everything checks out on this side."
@@ -1183,8 +1223,8 @@ edit_config() {
   [[ -f "$CONF" ]] || { err "No config present."; pause; return; }
   "${EDITOR:-nano}" "$CONF"
   if confirm "Restart the service and re-apply forwarding rules?"; then
-    fwd_apply
     systemctl restart aestun && msg "Service restarted."
+    fwd_apply
   fi
   pause
 }
@@ -1217,19 +1257,14 @@ netopt_menu() {
     cat <<EOF
 
   ${C}1${N}) Show current settings
-  ${C}2${N}) Apply / re-apply tuning (BBR + buffers)
+  ${C}2${N}) Apply / re-apply tuning (BBR + 16MB buffers + IP forwarding)
   ${C}3${N}) Remove tuning
   ${C}0${N}) Back
 EOF
     local __c; __c="$(ask 'Select' '0')" || return
     case "$__c" in
       1) show_network_opt; pause ;;
-      2)
-        local cc buf fwd
-        cc="$(ask_choice "Congestion control" "bbr" "bbr" "cubic")"
-        buf="$(ask_int 'Max socket buffer size in bytes' '16777216')"
-        if ask_yn 'Enable IP forwarding' 'Y'; then fwd=1; else fwd=0; fi
-        apply_network_opt "$cc" "$buf" "$fwd"; pause ;;
+      2) apply_network_opt "bbr" "16777216" "1"; pause ;;
       3) remove_network_opt; pause ;;
       0) return ;;
       *) warn "Invalid option"; sleep 1 ;;
@@ -1448,7 +1483,10 @@ with open(p,"w") as fp:
 PY
   chmod 600 "$CONF"
   msg "dpi_log.enabled = $want"
-  if ask_yn "Restart aestun now to apply" "Y"; then systemctl restart aestun && msg "restarted."; fi
+  if ask_yn "Restart aestun now to apply" "Y"; then
+    systemctl restart aestun && msg "restarted."
+    fwd_apply
+  fi
 }
 
 dpi_menu() {
@@ -1590,11 +1628,8 @@ EOF
       4) if [[ "$state" == *split=on* ]]; then antidpi_set split false; else antidpi_set split true; fi ;;
       5) antidpi_set_hop_ports; pause ;;
       0)
-        if confirm "Restart aestun now to apply any changes?"; then
-          fwd_apply
-          systemctl restart aestun && msg "Restarted."
-          sleep 1
-        fi
+        systemctl restart aestun >/dev/null 2>&1 || true
+        fwd_apply >/dev/null 2>&1 || true
         return ;;
       *) warn "Invalid option"; sleep 1 ;;
     esac
@@ -1637,8 +1672,9 @@ autotest() {
 
   local variants=(
     "baseline|{}"
+    "desync+junk+hop|{\"transport\":\"udp\",\"obfs\":\"quic\",\"desync\":{\"enabled\":true,\"repeats\":4},\"junk\":{\"enabled\":true},\"hop\":{\"enabled\":true,\"ports\":[443,8443,2053,2083,2087,2096],\"interval\":30}}"
     "desync+split+junk|{\"transport\":\"udp\",\"obfs\":\"quic\",\"desync\":{\"enabled\":true,\"repeats\":6},\"split\":{\"enabled\":true},\"junk\":{\"enabled\":true}}"
-    "port-hop|{\"transport\":\"udp\",\"obfs\":\"quic\",\"hop\":{\"enabled\":true,\"ports\":[443,2053,2083,2087,2096],\"interval\":20}}"
+    "port-hop|{\"transport\":\"udp\",\"obfs\":\"quic\",\"hop\":{\"enabled\":true,\"ports\":[443,8443,2053,2083,2087,2096],\"interval\":20}}"
     "tcp+tls|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true}}"
     "tcp+tls+rotate|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true},\"tcp_rotate\":{\"enabled\":true,\"interval_sec\":15}}"
   )
@@ -1656,6 +1692,7 @@ autotest() {
     printf '%s testing %-20s%s ' "$D" "$name" "$N"
     $RSSH 'systemctl restart aestun' >/dev/null 2>&1
     systemctl restart aestun >/dev/null 2>&1
+    fwd_apply >/dev/null 2>&1 || true
     local up=0 r1 r2 i
     for i in 1 2 3 4 5 6 7 8; do
       r1="$(json_get "$STATS" rx_packets)"; sleep 2; r2="$(json_get "$STATS" rx_packets)"
@@ -1913,7 +1950,7 @@ EOF
 Description=Run the aestun watchdog periodically
 
 [Timer]
-OnBootSec=90s
+OnBootSec=60s
 OnUnitActiveSec=30s
 AccuracySec=5s
 
@@ -1925,34 +1962,45 @@ EOF
 }
 
 watchdog_check() {
-  [[ -f "$CONF" && -f "$STATS" ]] || return 0
-  [[ "$(svc_active aestun)" == "active" ]] || return 0
+  [[ -f "$CONF" ]] || return 0
+  if [[ "$(svc_active aestun)" != "active" ]]; then
+    systemctl restart aestun >/dev/null 2>&1 || true
+    fwd_apply >/dev/null 2>&1 || true
+    return 0
+  fi
 
-  local ka lastrx real_now age thresh peer_ip
-  ka="$(json_get "$CONF" keepalive)"; ka="${ka:-25}"
+  ensure_tun_network
+
+  local peer_ip
   peer_ip="$(json_get "$CONF" peer_ip)"
-  lastrx="$(json_get "$STATS" last_rx_unix)"
-  real_now="$(date +%s)"
-  : "${lastrx:=0}"
-  [[ "$lastrx" -gt 0 ]] || return 0
-
-  age=$(( real_now - lastrx ))
-  thresh=$(( ka * 3 )); (( thresh < 90 )) && thresh=90
-  (( age < thresh )) && return 0
-
-  # Probe the peer over the tunnel first; if it replies, the link is alive (just idle)
   if [[ -n "$peer_ip" ]] && ping -c 2 -W 2 "$peer_ip" >/dev/null 2>&1; then
     return 0
   fi
 
+  local ka lastrx real_now age thresh
+  ka="$(json_get "$CONF" keepalive)"; ka="${ka:-25}"
+  lastrx="$(json_get "$STATS" last_rx_unix)"
+  real_now="$(date +%s)"
+  : "${lastrx:=0}"
+
+  if [[ "$lastrx" -gt 0 ]]; then
+    age=$(( real_now - lastrx ))
+  else
+    age=999
+  fi
+  thresh=$(( ka * 2 )); (( thresh < 60 )) && thresh=60
+  (( age < thresh )) && return 0
+
   mkdir -p "$(dirname "$WATCHDOG_STATE")"
   local last_restart=0
   [[ -f "$WATCHDOG_STATE" ]] && last_restart="$(cat "$WATCHDOG_STATE" 2>/dev/null || echo 0)"
-  (( real_now - last_restart < 120 )) && return 0
+  (( real_now - last_restart < 90 )) && return 0
 
-  logger -t aestun-watchdog "no data/ping from peer for ${age}s (>${thresh}s) — restarting aestun" 2>/dev/null || true
+  logger -t aestun-watchdog "no reply from ${peer_ip:-peer} for ${age}s — syncing clock, refreshing rules, restarting aestun" 2>/dev/null || true
   echo "$real_now" > "$WATCHDOG_STATE"
+  sync_clock_http
   systemctl restart aestun >/dev/null 2>&1 || true
+  fwd_apply >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -2010,38 +2058,36 @@ do_upgrade() {
 
   sync_mgr_bin
   ensure_deps
+  sync_clock_http
   ensure_binary || { err "No binary available."; return 1; }
 
   write_service
   systemctl daemon-reload
   ensure_loose_rp_filter "$(json_get "$CONF" tun_name)"
+  apply_network_opt "bbr" "16777216" "1"
   write_watchdog_units
 
-  local cur newc
-  cur="$(json_get "$CONF" cipher)"; cur="${cur:-aes-gcm}"
-  newc="$(ask_choice "Cipher suite" "$cur" "aes-gcm" "chacha20-poly1305")"
-
-  local dpion=true
-  ask_yn "Enable DPI/probe logging" "Y" || dpion=false
-
-  python3 - "$CONF" "$newc" "$dpion" "$DPI_LOG" <<'PY'
+  python3 - "$CONF" "$DPI_LOG" <<'PY'
 import json,sys
-path,cipher,dpion,logpath=sys.argv[1],sys.argv[2],sys.argv[3]=="true",sys.argv[4]
+path,logpath=sys.argv[1],sys.argv[2]
 with open(path) as fp:
     c=json.load(fp)
-c["cipher"]=cipher
+c["cipher"]="aes-gcm"
 d=c.setdefault("dpi_log",{})
-d["enabled"]=dpion
+d["enabled"]=True
 d.setdefault("path",logpath)
-d.setdefault("probe",True)
+d["probe"]=True
+c.setdefault("desync",{})["enabled"]=True
+c.setdefault("junk",{})["enabled"]=True
+c.setdefault("hop",{})["enabled"]=True
 with open(path,"w") as fp:
     json.dump(c,fp,indent=2)
 PY
   chmod 600 "$CONF"
-  msg "Config updated (cipher=$newc, dpi_log.enabled=$dpion)."
+  msg "Config updated with anti-DPI defaults."
 
-  fwd_apply
   systemctl restart aestun && msg "aestun restarted." || err "restart failed — see: journalctl -u aestun -n 50"
+  fwd_apply
 }
 
 # =============================================================================
