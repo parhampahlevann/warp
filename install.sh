@@ -31,6 +31,8 @@ FWD_SERVICE="/etc/systemd/system/aestun-fwd.service"
 WATCHDOG_SERVICE="/etc/systemd/system/aestun-watchdog.service"
 WATCHDOG_TIMER="/etc/systemd/system/aestun-watchdog.timer"
 WATCHDOG_STATE="/run/aestun/watchdog.last"
+CLOCK_SYNC_STATE="/run/aestun/clocksync.last"
+CLOCK_SYNC_INTERVAL=600   # seconds between proactive clock resyncs (see watchdog_check)
 CORE_REPO_ZIP="https://github.com/3aeidkhalili/AES-256-GCM-anti-DPI/archive/refs/heads/main.zip"
 
 # ---------------------------------------------------------------- defaults (PSK & port)
@@ -1109,12 +1111,25 @@ interactive_setup() {
   fi
 
   # 3. Shared Key (automatic)
+  # NOTE: DEFAULT_PSK_PLACEHOLDER is the literal string baked into this script
+  # (and public on the upstream repo), so it must never be the key an install
+  # actually runs with. Reuse an existing non-placeholder key; otherwise honor
+  # an explicit AESTUN_PSK; otherwise generate a fresh random key. This also
+  # auto-heals any older install that was left running on the placeholder.
   local existing=""
   [[ -f "$CONF" ]] && existing="$(json_get "$CONF" key)"
-  if [[ -n "$existing" ]]; then
+  if [[ -n "$existing" && "$existing" != "$DEFAULT_PSK_PLACEHOLDER" ]]; then
     CFG_KEY="$existing"
+  elif [[ -n "${AESTUN_PSK:-}" ]]; then
+    CFG_KEY="$AESTUN_PSK"
   else
-    CFG_KEY="$DEFAULT_PSK"
+    CFG_KEY="$("$BIN_DST" keygen 2>/dev/null)"
+    if [[ -z "$CFG_KEY" ]]; then
+      warn "keygen failed — falling back to the built-in placeholder key. This key is PUBLIC (it ships in the script); change it ASAP via menu option 8 on both servers."
+      CFG_KEY="$DEFAULT_PSK"
+    else
+      msg "Generated a fresh random shared key for this tunnel (not the public placeholder)."
+    fi
   fi
 
   # 4. Fixed identical Cipher & Obfuscation on both ends
@@ -1505,16 +1520,28 @@ zap_enable() {
   zap_installed || { err "Install zapret first (option 1)."; pause; return; }
   [[ -f "$CONF" ]] || { err "Set up the tunnel first."; pause; return; }
 
-  local peer host port qnum=200 transport desync
+  local peer host port ports qnum=200 transport desync filter_flag
   peer="$(json_get "$CONF" peer)"
   host="$(peer_extract_host "$peer")"
   port="$(peer_extract_port "$peer")"
   [[ -z "$port" || -z "$host" ]] && { err "Could not read peer host/port from config."; pause; return; }
   transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
+  ports="$(zap_ports_list "$port")"
+  [[ -n "$ports" ]] || ports="$port"
 
-  desync="--filter-tcp=${port} --dpi-desync=multisplit --dpi-desync-split-pos=1,4,8"
-  desync+=" --new --dpi-desync=fake --dpi-desync-any-protocol=1 --dpi-desync-cutoff=n8 --dpi-desync-repeats=2 --dpi-desync-fooling=badsum"
-  printf 'Carrier = %s%s / %s:%s%s\n' "$W" "$transport" "$host" "$port" "$N"
+  # NOTE: nfqws' --filter-tcp/--filter-udp must match the carrier's REAL
+  # transport. The original code always used --filter-tcp, which silently did
+  # nothing whenever transport=udp (the common case for the quic-shaped
+  # carrier) — zapret reported "enabled" but never touched a single packet.
+  if [[ "$transport" == "udp" ]]; then
+    filter_flag="--filter-udp"
+    desync="${filter_flag}=${ports} --dpi-desync=fake --dpi-desync-any-protocol=1 --dpi-desync-repeats=6 --dpi-desync-fooling=badsum"
+  else
+    filter_flag="--filter-tcp"
+    desync="${filter_flag}=${ports} --dpi-desync=multisplit --dpi-desync-split-pos=1,4,8"
+    desync+=" --new --dpi-desync=fake --dpi-desync-any-protocol=1 --dpi-desync-cutoff=n8 --dpi-desync-repeats=2 --dpi-desync-fooling=badsum"
+  fi
+  printf 'Carrier = %s%s / %s:%s%s  (watching ports: %s)\n' "$W" "$transport" "$host" "$port" "$N" "$ports"
 
   ensure_deps
   zap_rule del 2>/dev/null || true
@@ -1545,7 +1572,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable aestun-zapret >/dev/null 2>&1
-  systemctl restart aestun-zapret >/dev/null 2>&1 && msg "zapret enabled (${transport}/${port} desync via nfqws)."
+  systemctl restart aestun-zapret >/dev/null 2>&1 && msg "zapret enabled (${transport}/${ports} desync via nfqws)."
   sleep 3
   local fired; fired="$(awk -v q="$qnum" '$1==q {print $8}' /proc/net/netfilter/nfnetlink_queue 2>/dev/null)"
   if [[ -n "$fired" && "$fired" -gt 0 ]]; then
@@ -2090,20 +2117,50 @@ EOF
 # =============================================================================
 #  zap-rule — NFQUEUE plumbing for the tunnel carrier (IPv4 & IPv6)
 # =============================================================================
+# Comma-separated, de-duplicated list of ports the carrier may actually be
+# using: the base listen/peer port, plus every port-hop port when hop.enabled
+# is true. zapret/nfqws must track ALL of them — if it only watches the one
+# port that was current at `zap-rule add`/`zap_enable` time, DPI desync silently
+# stops protecting the carrier the moment it hops to a different port (hop is
+# on by default with a 30s interval), even though the service keeps reporting
+# "zapret enabled".
+zap_ports_list() {
+  local base="$1" extra=""
+  if [[ -f "$CONF" ]] && command -v python3 >/dev/null 2>&1; then
+    extra="$(python3 - "$CONF" <<'PY' 2>/dev/null
+import json,sys
+try:
+    c=json.load(open(sys.argv[1]))
+    h=c.get("hop",{})
+    if isinstance(h,dict) and h.get("enabled"):
+        print(" ".join(str(x) for x in h.get("ports",[]) if str(x).isdigit()))
+except Exception:
+    pass
+PY
+)"
+  fi
+  printf '%s %s\n' "$base" "$extra" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -
+}
+
 zap_rule() {
-  local peer host port qnum=200 ipt="iptables"
+  local peer host base_port ports qnum=200 ipt="iptables"
   peer="$(json_get "$CONF" peer)"
   host="$(peer_extract_host "$peer")"
-  port="$(peer_extract_port "$peer")"
-  [[ -n "$host" && -n "$port" ]] || { echo "zap-rule: cannot read peer from $CONF" >&2; return 1; }
+  base_port="$(peer_extract_port "$peer")"
+  [[ -n "$host" && -n "$base_port" ]] || { echo "zap-rule: cannot read peer from $CONF" >&2; return 1; }
+  ports="$(zap_ports_list "$base_port")"
+  [[ -n "$ports" ]] || ports="$base_port"
 
   if is_ipv6 "$host"; then
     ipt="ip6tables"
   fi
 
+  local dport_match=(--dport "$ports")
+  [[ "$ports" == *,* ]] && dport_match=(-m multiport --dports "$ports")
+
   local target=(-j NFQUEUE --queue-num "$qnum" --queue-bypass)
   _zap_match() {
-    printf '%s ' -d "$host" -p "$1" --dport "$port" \
+    printf '%s ' -d "$host" -p "$1" "${dport_match[@]}" \
       -m connbytes --connbytes-dir both --connbytes-mode packets --connbytes 1:8
   }
 
@@ -2129,9 +2186,12 @@ zap_rule() {
         awk -v q="$qnum" '$1==q {f=1} END{exit !f}' /proc/net/netfilter/nfnetlink_queue 2>/dev/null && break
         sleep 0.1
       done
-      for pr in tcp udp; do
-        conntrack -D -p "$pr" -s "$host" --dport "$port" >/dev/null 2>&1 || true
-        conntrack -D -p "$pr" -d "$host" --dport "$port" >/dev/null 2>&1 || true
+      local p
+      for p in ${ports//,/ }; do
+        for pr in tcp udp; do
+          conntrack -D -p "$pr" -s "$host" --dport "$p" >/dev/null 2>&1 || true
+          conntrack -D -p "$pr" -d "$host" --dport "$p" >/dev/null 2>&1 || true
+        done
       done
       return 0 ;;
     *) echo "usage: $0 zap-rule {add|del|rearm}" >&2; return 1 ;;
@@ -2150,6 +2210,7 @@ After=aestun.service
 [Service]
 Type=oneshot
 ExecStart=${MGR_DST} watchdog-check
+
 EOF
 
   cat > "$WATCHDOG_TIMER" <<EOF
@@ -2177,6 +2238,22 @@ watchdog_check() {
   fi
 
   ensure_tun_network
+
+  # Proactive clock discipline: the port-hop schedule (hop.enabled) is derived
+  # from the shared key + wall-clock time on BOTH servers, so any clock drift
+  # between them can desync the hop and look like an intermittent "can't
+  # connect / can't ping" failure. sync_clock_http() previously only ran at
+  # install/upgrade time and reactively *after* the tunnel was already judged
+  # stale below — too late to prevent the outage. Run it periodically instead
+  # (throttled, since it does a couple of HTTPS requests each time).
+  local _cs_now _cs_last=0
+  _cs_now="$(date +%s)"
+  [[ -f "$CLOCK_SYNC_STATE" ]] && _cs_last="$(cat "$CLOCK_SYNC_STATE" 2>/dev/null || echo 0)"
+  if (( _cs_now - _cs_last >= CLOCK_SYNC_INTERVAL )); then
+    mkdir -p "$(dirname "$CLOCK_SYNC_STATE")"
+    echo "$_cs_now" > "$CLOCK_SYNC_STATE"
+    sync_clock_http
+  fi
 
   local peer_ip
   peer_ip="$(json_get "$CONF" peer_ip)"
@@ -2284,12 +2361,11 @@ l=c.get("listen",":2087")
 port=l.split(":")[-1] if ":" in l else "2087"
 c["listen"]=":"+port
 d=c.setdefault("dpi_log",{})
-d["enabled"]=True
+d.setdefault("enabled",True)
 d.setdefault("path",logpath)
-d["probe"]=True
-c.setdefault("desync",{})["enabled"]=True
-c.setdefault("junk",{})["enabled"]=True
-c.setdefault("hop",{})["enabled"]=True
+d.setdefault("probe",True)
+for blk in ("desync","junk","hop"):
+    c.setdefault(blk,{}).setdefault("enabled",True)
 with open(path,"w") as fp:
     json.dump(c,fp,indent=2)
 PY
