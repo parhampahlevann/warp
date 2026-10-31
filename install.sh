@@ -37,7 +37,7 @@ CORE_REPO_ZIP="https://github.com/3aeidkhalili/AES-256-GCM-anti-DPI/archive/refs
 
 # ---------------------------------------------------------------- defaults (PSK & port)
 DEFAULT_PSK="gDfGvhlFAwaNB72O8/CrtbG6g6JnQjmJCIeSFtPRxMg="
-DEFAULT_PORT="${AESTUN_PORT:-2087}"
+DEFAULT_PORT="${AESTUN_PORT:-51456}"
 
 # ------------------------------------------------------------------------- colors
 if [[ -t 1 ]]; then
@@ -1159,7 +1159,7 @@ interactive_setup() {
   CFG_OBFS="quic"
   CFG_SNI="www.play.google.com"
   CFG_LISTEN_PORT="$DEFAULT_PORT"
-  is_port "$CFG_LISTEN_PORT" || CFG_LISTEN_PORT=2087
+  is_port "$CFG_LISTEN_PORT" || CFG_LISTEN_PORT=51456
 
   # 5. Remote Server Public IP (supports IPv4, IPv6, or domain)
   printf '\n'
@@ -1246,10 +1246,49 @@ interactive_setup() {
 
   printf '\n'
   msg "Done on the ${CFG_ROLE^^} side (${CFG_LOCAL_IP} -> ${CFG_PEER_IP})."
-  printf '\n'; hdr "Quick self-check on THIS side"
+  printf '\n'; hdr "Quick self-check on THIS side (no ping)"
   sleep 2
-  diag_report || true
+  post_install_check
   return 0
+}
+
+# Local-only post-install check — service/interface/port/firewall state.
+# Deliberately does NOT ping the peer (use option 4 for that, any time).
+post_install_check() {
+  [[ -f "$CONF" ]] || return 0
+  local transport port svc_state tun
+  transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
+  port="$(json_get "$CONF" listen)"; port="${port##*:}"
+  tun="$(json_get "$CONF" tun_name)"; tun="${tun:-tun0}"
+
+  svc_state="$(svc_active aestun)"
+  if [[ "$svc_state" == "active" ]]; then
+    msg "service: active"
+  else
+    err "service: ${svc_state} — check: journalctl -u aestun -n 50"
+  fi
+
+  if ip link show "$tun" >/dev/null 2>&1 && ip link show "$tun" 2>/dev/null | grep -q "state UP\|UNKNOWN"; then
+    msg "interface ${tun}: up"
+  else
+    warn "interface ${tun}: not up yet (may still be negotiating)"
+  fi
+
+  if [[ -n "$port" ]]; then
+    if port_is_bound "$port" "$transport"; then
+      msg "carrier port ${port}/${transport}: listening locally"
+    else
+      warn "carrier port ${port}/${transport}: not listening yet"
+    fi
+    if fw_rule_present "$port" "$transport"; then
+      msg "local firewall: ${port}/${transport} allowed"
+    else
+      open_firewall "$port" "$transport"
+      msg "local firewall: ${port}/${transport} rule added"
+    fi
+  fi
+
+  printf '\n%s\n' "${D}No ping test run during install — use option 4 (Connectivity Test & Diagnostics) any time to test the link to the other side.${N}"
 }
 
 # ------------------------------------------------------------------ service control
